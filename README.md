@@ -322,7 +322,7 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 | Sandbox | Code Interpreter in SANDBOX network mode, no execution role: it only receives result rows the user could already query |
 | Who edits | `quicksight:UpdateAnalysis` on that analysis for the user (QuickSight sharing); apply only by the requester, once, within 10 minutes; the previous definition is backed up to S3 before every change |
 | Identity to tools | The Runtime adds the verified token to this solution's own tool calls in code; the model cannot see or forge it; enterprise MCP servers do not get it |
-| Data flow | Questions and results go to your model endpoint; logs in CloudWatch never contain tokens or passwords |
+| Data flow | Questions and results go to your model endpoint; CloudWatch logs never contain tokens or passwords, and do not log the sign-in email (a non-reversible per-user reference is used instead), the SAML attributes, or model-output text (only sizes/counts for diagnostics) |
 
 SPICE datasets: built-in queries read the current source data, which may be newer than the last SPICE refresh (the
 answer says so).
@@ -673,7 +673,7 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 | 沙箱 | Code Interpreter 为 SANDBOX 网络模式，没有执行角色：只拿到用户本来就能查询的结果行 |
 | 谁能修改 | 用户对该分析有 `quicksight:UpdateAnalysis`（QuickSight 共享）；只有发起人能在 10 分钟内应用一次；每次修改前都把原定义备份到 S3 |
 | 工具拿到的身份 | Runtime 在代码里把已验证的令牌附加到本方案自己的工具调用上；模型看不到也伪造不了；企业 MCP 服务器拿不到 |
-| 数据流向 | 提问和结果发送到你的模型端点；CloudWatch 日志里不含令牌或密码 |
+| 数据流向 | 提问和结果发送到你的模型端点；CloudWatch 日志里不含令牌或密码，也不记录登录邮箱（改用不可逆的按用户标识）、SAML 属性或模型输出文本（仅记录长度/计数用于诊断）|
 
 SPICE 数据集：内置查询读取的是源数据的当前值，可能比上次 SPICE 刷新更新（回答里会说明）。
 

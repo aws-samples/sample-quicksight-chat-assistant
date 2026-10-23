@@ -473,7 +473,7 @@ def run_agent(payload, cancel_signal=None):
         if time.time() - stream["logged"] > 20:
             stream["logged"] = time.time()
             log(event="model_streaming", since_s=int(time.time() - timing["mark"]), chars=stream["chars"],
-                reasoning_chars=stream["reasoning"], tool_input_chars=stream.get("tool_input", 0), tail=stream["tail"])
+                reasoning_chars=stream["reasoning"], tool_input_chars=stream.get("tool_input", 0))
 
     def after_model(event: AfterModelCallEvent):
         ms = int((time.time() - timing["mark"]) * 1000)
@@ -490,11 +490,13 @@ def run_agent(payload, cancel_signal=None):
         if event.exception is None:
             timing["retries"] = 0
         stop = event.stop_response.stop_reason if event.stop_response else None
-        if stop not in ("end_turn", "tool_use"):  # unusual end (max_tokens, error): keep a short excerpt for diagnosis
+        if stop not in ("end_turn", "tool_use"):  # unusual end (max_tokens, error): log structure for diagnosis
             parts = (event.stop_response.message.get("content", []) if event.stop_response else [])
-            excerpt = json.dumps([p.get("text") or p.get("toolUse") or "" for p in parts], ensure_ascii=False)[:400]
+            # Record the shape of the response (which block kinds, how big) without logging user-facing content.
+            shape = [("text" if p.get("text") is not None else "toolUse" if p.get("toolUse") is not None else "other",
+                      len(json.dumps(p.get("text") or p.get("toolUse") or "", ensure_ascii=False))) for p in parts]
             log(event="model_call", ms=ms, stop=stop, error=repr(event.exception)[:300] if event.exception else None,
-                excerpt=excerpt)
+                content_shape=shape)
 
     def before_tool(event: BeforeToolCallEvent):
         timing[event.tool_use.get("toolUseId")] = time.time()  # tools may run concurrently: per call

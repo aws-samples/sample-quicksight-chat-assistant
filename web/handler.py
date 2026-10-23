@@ -74,6 +74,12 @@ PAGE_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8",
 POPUP_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "frame-ancestors 'none'"}
 
 
+def _uref(sub):
+    """Non-reversible short reference for a user, for logs only. Keeps per-user
+    correlation in CloudWatch without writing the sign-in email (PII) to logs."""
+    return "u_" + hashlib.sha256((sub or "").encode("utf-8")).hexdigest()[:12]
+
+
 def respond(status, body, headers=None):
     return {"statusCode": status,
             "headers": headers or {**SECURITY_HEADERS, "Content-Type": "application/json; charset=utf-8"},
@@ -143,8 +149,8 @@ def login_finish(event):
     except Exception as error:  # noqa: BLE001
         print(json.dumps({"auth": "error", "error": repr(error)[:500]}, ensure_ascii=False))
         return respond(500, popup_page("登录失败", "签名或断言校验出错，请稍后重试。"), POPUP_HEADERS)
-    print(json.dumps({"auth": "ok", "sub": payload["sub"], "exp": payload["exp"],
-                      "name_source": payload.get("name_source"), "saml_attributes": _attributes}, ensure_ascii=False))
+    print(json.dumps({"auth": "ok", "user": _uref(payload["sub"]), "exp": payload["exp"],
+                      "name_source": payload.get("name_source")}, ensure_ascii=False))
     message = {"type": "qsca-auth", "nonce": nonce, "token": token,
                "user": {"sub": payload["sub"], "name": payload["name"], "exp": payload["exp"]}}
     return respond(200, popup_page("登录成功", "正在返回聊天窗口…", message, origin(event)), POPUP_HEADERS)
@@ -174,7 +180,7 @@ def submit(event, user):
             answer, ok = f"已把分析的当前内容发布到仪表盘 {names}。打开仪表盘后刷新即可看到；刚发布时图表可能短暂报错，再刷新一次。", True
         steps = [{"tool": "publish_dashboards", "arguments": {}, "ok": ok}]
         job_id = answer_directly(user, answer, steps)
-        print(json.dumps({"job": job_id, "user": user["sub"], "event": "publish_command", "ok": ok,
+        print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "publish_command", "ok": ok,
                           "ms": int((time.time() - started) * 1000)}))
         return respond(202, {"jobId": job_id, "sessionId": session_id})
     # A Runtime session keeps the code version it started with and the browser reuses its id for hours, so bind the
@@ -206,7 +212,7 @@ def submit(event, user):
                          ExpressionAttributeNames={"#s": "status", "#e": "error"},
                          ExpressionAttributeValues={":s": "FAILED", ":e": f"提交到 Runtime 失败: {str(error)[:300]}"})
         return respond(502, {"error": "runtime did not accept the job", "jobId": job_id})
-    print(json.dumps({"job": job_id, "user": user["sub"], "event": "submitted", "analysis": analysis, "where": where,
+    print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "submitted", "analysis": analysis, "where": where,
                       "runtimeVersion": RUNTIME_VERSION}, ensure_ascii=False))
     return respond(202, {"jobId": job_id, "sessionId": session_id, "status": "RUNNING"})
 
@@ -252,7 +258,7 @@ def cancel(job_id, user):
         signalled = bool(json.loads(response["response"].read().decode("utf-8")).get("cancelled"))
     except Exception as error:  # noqa: BLE001
         print(json.dumps({"job": job_id, "cancelSignal": repr(error)[:500]}))
-    print(json.dumps({"job": job_id, "user": user["sub"], "event": "cancelled", "signalled": signalled}))
+    print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "cancelled", "signalled": signalled}))
     return respond(200, {"jobId": job_id, "status": "CANCELLED", "signalled": signalled})
 
 
@@ -269,7 +275,7 @@ def apply_change(change_id, event, user):
         {"__tool": "apply_pending_change", "pending_change_id": change_id, "_caller": bearer(event),
          "_analysis": analysis}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
-    print(json.dumps({"change": change_id, "user": user["sub"], "event": "apply", "ok": "error" not in result,
+    print(json.dumps({"change": change_id, "user": _uref(user["sub"]), "event": "apply", "ok": "error" not in result,
                       "error": result.get("error")}, ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
@@ -298,7 +304,7 @@ def run_button_tool(event, user, tool, analysis=None, extra=None):
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(payload).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     if tool == "bind_chat":
-        print(json.dumps({"user": user["sub"], "event": "bind_chat", "analysis": analysis, "ok": "error" not in result,
+        print(json.dumps({"user": _uref(user["sub"]), "event": "bind_chat", "analysis": analysis, "ok": "error" not in result,
                           "changed": result.get("changed"), "error": result.get("error")}, ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
@@ -309,7 +315,7 @@ def run_publish(event, user, analysis):
         {"__tool": "publish_dashboards", "_caller": bearer(event), "_analysis": analysis,
          "_chat_url": f"https://{domain}"}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
-    print(json.dumps({"user": user["sub"], "event": "publish_dashboards", "ok": "error" not in result,
+    print(json.dumps({"user": _uref(user["sub"]), "event": "publish_dashboards", "ok": "error" not in result,
                       "published": result.get("published"), "error": result.get("error")}, ensure_ascii=False))
     return result
 
