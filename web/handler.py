@@ -80,6 +80,19 @@ def _uref(sub):
     return "u_" + hashlib.sha256((sub or "").encode("utf-8")).hexdigest()[:12]
 
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _safe_err(text):
+    """Redact email addresses from a tool-error string before it is logged.
+    Analysis/data tools build some errors with the user's email (e.g.
+    '<email> 没有编辑这个分析的权限'); the user still sees the full message in the
+    response, but the email must not reach CloudWatch."""
+    if not isinstance(text, str):
+        return text
+    return _EMAIL_RE.sub("<redacted-email>", text)
+
+
 def respond(status, body, headers=None):
     return {"statusCode": status,
             "headers": headers or {**SECURITY_HEADERS, "Content-Type": "application/json; charset=utf-8"},
@@ -276,7 +289,7 @@ def apply_change(change_id, event, user):
          "_analysis": analysis}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     print(json.dumps({"change": change_id, "user": _uref(user["sub"]), "event": "apply", "ok": "error" not in result,
-                      "error": result.get("error")}, ensure_ascii=False))
+                      "error": _safe_err(result.get("error"))}, ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
 
@@ -305,7 +318,7 @@ def run_button_tool(event, user, tool, analysis=None, extra=None):
     result = json.loads(response["Payload"].read() or b"{}")
     if tool == "bind_chat":
         print(json.dumps({"user": _uref(user["sub"]), "event": "bind_chat", "analysis": analysis, "ok": "error" not in result,
-                          "changed": result.get("changed"), "error": result.get("error")}, ensure_ascii=False))
+                          "changed": result.get("changed"), "error": _safe_err(result.get("error"))}, ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
 
@@ -316,7 +329,7 @@ def run_publish(event, user, analysis):
          "_chat_url": f"https://{domain}"}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     print(json.dumps({"user": _uref(user["sub"]), "event": "publish_dashboards", "ok": "error" not in result,
-                      "published": result.get("published"), "error": result.get("error")}, ensure_ascii=False))
+                      "published": result.get("published"), "error": _safe_err(result.get("error"))}, ensure_ascii=False))
     return result
 
 

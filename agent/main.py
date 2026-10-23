@@ -21,6 +21,7 @@ sandbox), suggest_controls. Chart numbers always come from tool results.
 """
 
 import copy
+import hashlib
 import datetime as dt
 import json
 import os
@@ -82,6 +83,13 @@ def log(**fields):
     if fields.get("event") != "start":
         fields["vm"] = vm_instance()
     print(json.dumps(fields, ensure_ascii=False, default=str), flush=True)
+
+
+def _uref(sub):
+    """Non-reversible short reference for a user, for logs only. The signed-in
+    sub is the user's email (PII); the web Lambda hashes it the same way before
+    logging, so keep the Runtime logs consistent and free of the raw email."""
+    return "u_" + hashlib.sha256((sub or "").encode("utf-8")).hexdigest()[:12]
 
 
 class ConfigError(Exception):
@@ -540,7 +548,7 @@ def run_agent(payload, cancel_signal=None):
         if undo and analysis:
             answer, steps = (DASHBOARD_EDIT_MESSAGE, []) if in_dashboard else run_undo(mcp, injected, force=undo["force"])
             elapsed = int((time.time() - started) * 1000)
-            log(event="answered", user=user.get("sub"), analysis=analysis, steps=1, charts=0, elapsed_ms=elapsed,
+            log(event="answered", user=_uref(user.get("sub")), analysis=analysis, steps=1, charts=0, elapsed_ms=elapsed,
                 model=None, setup_ms=elapsed, model_ms=[], tool_ms=elapsed, usage={})
             return {"answer": answer, "steps": steps, "model": "（直接执行）", "elapsed_ms": elapsed}
         gateway_tools = mcp.list_tools_sync()
@@ -588,7 +596,7 @@ def run_agent(payload, cancel_signal=None):
         raise Cancelled()
     answer = "".join(part.get("text", "") for part in result.message.get("content", []) if "text" in part).strip()
     elapsed = int((time.time() - started) * 1000)
-    log(event="answered", user=user.get("sub"), analysis=analysis, steps=len(steps), charts=len(state["charts"]),
+    log(event="answered", user=_uref(user.get("sub")), analysis=analysis, steps=len(steps), charts=len(state["charts"]),
         elapsed_ms=elapsed, model=cfg["model"], setup_ms=timing.get("setup_ms"), model_ms=timing["model_ms"],
         tool_ms=timing["tool_ms"], usage=result.metrics.accumulated_usage)
     out = {"answer": answer, "steps": steps, "model": cfg["model"], "elapsed_ms": elapsed}
