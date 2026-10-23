@@ -1,0 +1,20 @@
+# Third-Party Licenses
+
+This project bundles the following third-party browser scripts, served by the web
+Lambda under `/static/<file>` so the chat page needs no CDN. Each file is copied
+unmodified from the npm package below (see `web/vendor/README.md` for the pinned
+npm integrity values).
+
+| Component | Version | License | License file |
+|---|---|---|---|
+| ECharts (`echarts-6.1.0.min.js`) | 6.1.0 | Apache-2.0 | `web/vendor/ECHARTS-LICENSE` |
+| marked (`marked-18.1.1.umd.js`) | 18.1.1 | MIT | `web/vendor/MARKED-LICENSE` |
+| DOMPurify (`purify-3.4.17.min.js`) | 3.4.17 | Apache-2.0 OR MPL-2.0 | `web/vendor/DOMPURIFY-LICENSE` |
+
+The full text of each license is included in the referenced file under `web/vendor/`.
+
+Node.js build-time dependencies for the CDK app (`infra/`) and any Python
+dependencies installed at build time are not redistributed in this repository;
+their licenses remain with their respective upstream projects and are resolved
+from the pinned manifests (`infra/package-lock.json` and the packaged Python
+requirements).
