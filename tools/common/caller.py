@@ -157,5 +157,25 @@ def require_editor(args):
     return email, aid
 
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def uref(email):
+    """Non-reversible short reference for a user, for logs only. The signed-in
+    identity is the user's email (PII); web/auth.py and agent/main.py hash it the
+    same way, so logs across the Lambdas and the Runtime stay correlatable without
+    writing the raw email to CloudWatch."""
+    return "u_" + hashlib.sha256((email or "").encode("utf-8")).hexdigest()[:12]
+
+
+def safe_err(text):
+    """Redact email addresses from a tool-error string before it is logged.
+    Some refusals embed the user's email (e.g. '<email> 没有编辑这个分析的权限');
+    the model/user still receives the full message, but the email must not reach logs."""
+    if not isinstance(text, str):
+        return text
+    return _EMAIL_RE.sub("<redacted-email>", text)
+
+
 def log(**fields):
     print(json.dumps(fields, ensure_ascii=False, default=str))

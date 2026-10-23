@@ -135,7 +135,7 @@ def preview_analysis_change(args):
     jobs.put_item(Item={"jobId": f"pending#{change_id}", "status": "PENDING", "owner": email, "analysisId": aid,
                         "edit": json.dumps(edit, ensure_ascii=False), "summary": summary, "createdAt": now,
                         "expiresAt": now + PENDING_SECONDS})
-    log(event="analysis_change_previewed", by=email, analysis=aid, edit=edit.get("operation"), change=change_id)
+    log(event="analysis_change_previewed", by=caller.uref(email), analysis=aid, edit=edit.get("operation"), change=change_id)
     return {"pending_change_id": change_id, "expires_at": now + PENDING_SECONDS, "summary": summary,
             "visual_id": visual_id, "title": title, "kind": kind,
             "preview": {k: v for k, v in preview.items() if k != "summary"},
@@ -157,7 +157,7 @@ def _apply(email, aid, edit):
                                    "summary": summary, "edit": edit}, ensure_ascii=False).encode())
     updated = _save(aid, name, definition)
     _tag_saved_state(key, updated, _analysis(aid)[1])  # the definition as QuickSight stored it
-    log(event="analysis_changed", by=email, analysis=aid, edit=edit.get("operation"), visual=visual_id, backup=key)
+    log(event="analysis_changed", by=caller.uref(email), analysis=aid, edit=edit.get("operation"), visual=visual_id, backup=key)
     return visual_id, summary
 
 
@@ -221,7 +221,7 @@ def undo_last_visual_change(args):
     s3.delete_object(Bucket=BUCKET, Key=key)
     if len(keys) > 1:  # the analysis is now as it was right after the previous change, which stays undoable
         _tag_saved_state(keys[-2], restored_at, _analysis(aid)[1])
-    log(event="analysis_change_undone", by=email, analysis=aid, visual=saved.get("visual_id"), backup=key)
+    log(event="analysis_change_undone", by=caller.uref(email), analysis=aid, visual=saved.get("visual_id"), backup=key)
     return {"undone": True, "undid": saved.get("summary") or f"{saved.get('visual_id')} 的修改",
             "message": "已撤销，请手动刷新页面查看。"}
 
@@ -250,7 +250,7 @@ def publish_dashboards(args):
         except RuntimeError as error:
             raise ToolError(f"发布到仪表盘“{current['Name']}”失败：{error}") from error
         published.append({"dashboard_id": dashboard_id, "name": current["Name"], "version": version})
-        log(event="dashboard_published", by=email, analysis=aid, dashboard=dashboard_id, version=version)
+        log(event="dashboard_published", by=caller.uref(email), analysis=aid, dashboard=dashboard_id, version=version)
     if not published:
         raise ToolError("没有你可以发布的仪表盘：这个分析还没发布过仪表盘（第一次请在 QuickSight 控制台发布），"
                         "或你没有更新它的权限" + (f"（{len(skipped)} 个仪表盘无权限）" if skipped else ""))
@@ -345,7 +345,7 @@ def bind_chat(args):
     if len(url) > 2048:
         raise ToolError("分析的参数太多，聊天地址会超过 2048 个字符；请减少参数后再绑定")
     _save(aid, name, definition)
-    log(event="chat_bound", by=email, analysis=aid, visuals=changed, parameters=len(_parameter_names(definition)))
+    log(event="chat_bound", by=caller.uref(email), analysis=aid, visuals=changed, parameters=len(_parameter_names(definition)))
     return {"changed": True, "analysis_id": aid, "name": name,
             "message": "已绑定。请刷新页面（编辑界面刷新后聊天窗口才会用上新地址）。"}
 
@@ -403,7 +403,7 @@ def save_examples(args):
     key = _examples_key(aid)
     if args.get("reset"):
         jobs.delete_item(Key=key)
-        log(event="examples_reset", by=email, analysis=aid)
+        log(event="examples_reset", by=caller.uref(email), analysis=aid)
         return {"groups": None}
     if isinstance(args.get("add"), dict):
         current = jobs.get_item(Key=key).get("Item") or {}
@@ -425,7 +425,7 @@ def save_examples(args):
     if len(text.encode()) > 20000:
         raise ToolError("示例问题太多，请删减后再保存")
     jobs.put_item(Item={**key, "groups": text, "updatedBy": email, "updatedAt": int(time.time())})
-    log(event="examples_saved", by=email, analysis=aid, groups=len(groups), questions=sum(len(g["questions"]) for g in groups))
+    log(event="examples_saved", by=caller.uref(email), analysis=aid, groups=len(groups), questions=sum(len(g["questions"]) for g in groups))
     return {"groups": groups}
 
 
@@ -452,7 +452,7 @@ def handler(event, context):
         # QuickSight definitions contain datetimes (e.g. date parameter defaults); Lambda only returns plain JSON.
         return json.loads(json.dumps(tool(event), ensure_ascii=False, default=str))
     except ToolError as error:
-        log(event="tool_refused", tool=name, reason=str(error))
+        log(event="tool_refused", tool=name, reason=caller.safe_err(str(error)))
         return {"error": str(error)}
     except Exception as error:  # noqa: BLE001 - never leak stack traces to the model
         log(event="tool_failed", tool=name, error=repr(error)[:500])

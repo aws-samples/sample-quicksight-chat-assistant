@@ -195,7 +195,7 @@ def handler(event, context):
         # QuickSight definitions contain datetimes (e.g. date parameter defaults); Lambda only returns plain JSON.
         return json.loads(json.dumps(tool(event), ensure_ascii=False, default=str))
     except ToolError as error:
-        log(event="tool_refused", tool=name, reason=str(error))
+        log(event="tool_refused", tool=name, reason=caller.safe_err(str(error)))
         return {"error": str(error)}
     except Exception as error:  # noqa: BLE001 - never leak stack traces to the model
         log(event="tool_failed", tool=name, error=repr(error)[:500])

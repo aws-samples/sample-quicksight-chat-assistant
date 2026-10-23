@@ -227,9 +227,25 @@ export class ChatAssistantStack extends Stack {
         'bedrock-agentcore:StopCodeInterpreterSession', 'bedrock-agentcore:GetCodeInterpreterSession'],
       resources: [codeInterpreter.attrCodeInterpreterArn],
     }));
+    // AgentCore Runtime logs go to /aws/bedrock-agentcore/runtimes/*; scope the log-group and
+    // log-stream actions to that namespace instead of every log group in the account. (Can be
+    // narrowed further to `${prefix}_agent-*`.) X-Ray and PutMetricData have no resource-level
+    // support, so they stay on `*`.
+    const runtimeLogGroups = `arn:${partition}:logs:${this.region}:${this.account}:log-group:/aws/bedrock-agentcore/runtimes/*`;
     runtimeRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'logs:DescribeLogGroups',
-        'xray:PutTraceSegments', 'xray:PutTelemetryRecords', 'cloudwatch:PutMetricData'],
+      actions: ['logs:CreateLogGroup', 'logs:DescribeLogStreams'],
+      resources: [runtimeLogGroups],
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+      resources: [`${runtimeLogGroups}:log-stream:*`],
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['logs:DescribeLogGroups'],
+      resources: [`arn:${partition}:logs:${this.region}:${this.account}:log-group:*`],
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['xray:PutTraceSegments', 'xray:PutTelemetryRecords', 'cloudwatch:PutMetricData'],
       resources: ['*'],
     }));
     runtimeRole.addToPolicy(new iam.PolicyStatement({
