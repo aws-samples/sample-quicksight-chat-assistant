@@ -82,7 +82,7 @@ export class ChatAssistantStack extends Stack {
       SESSION_SECRET_ID: sessionKey.secretName, ALLOWED_ANALYSIS_IDS: config.quickSight.allowedAnalysisIds.join(','),
     };
     const quicksightRead = new iam.PolicyStatement({
-      actions: ['quicksight:DescribeAnalysis', 'quicksight:DescribeAnalysisDefinition', 'quicksight:DescribeAnalysisPermissions'],
+      actions: ['quicksight:DescribeAnalysis', 'quicksight:DescribeAnalysisPermissions'],
       resources: analysisResources,
     });
     const quicksightPeople = new iam.PolicyStatement({
@@ -110,7 +110,7 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:UpdateAnalysis'], resources: analysisResources }));
     // The 发布到仪表盘 button: publish the analysis to its dashboards (users' dashboard permissions checked in code).
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['quicksight:DescribeDashboardDefinition', 'quicksight:UpdateDashboard', 'quicksight:UpdateDashboardPublishedVersion',
+      actions: ['quicksight:UpdateDashboard', 'quicksight:UpdateDashboardPublishedVersion',
         'quicksight:TagResource'],
       resources: [`${qs}:dashboard/*`],
     }));
@@ -301,7 +301,7 @@ export class ChatAssistantStack extends Stack {
       description: 'After a dashboard is published, marks this solution\'s chat in it as running in a dashboard.',
     });
     publisherFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['quicksight:DescribeDashboard', 'quicksight:DescribeDashboardDefinition', 'quicksight:UpdateDashboard',
+      actions: ['quicksight:DescribeDashboard', 'quicksight:UpdateDashboard',
         'quicksight:ListDashboardVersions',
         'quicksight:UpdateDashboardPublishedVersion', 'quicksight:TagResource'],
       resources: [`${qs}:dashboard/*`],
