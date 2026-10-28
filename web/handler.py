@@ -1,10 +1,11 @@
 """API Gateway HTTP API Lambda for the chat panel embedded in QuickSight.
 
 Routes:
-  GET  /                       chat page (index.html)
-  GET  /static/<vendor file>   ECharts / marked / DOMPurify, versioned file names, cached for a year
+  GET  /                       chat page (index.html; its script is /static/app-<hash>.js, no inline script)
+  GET  /static/<file>          app.js and the vendored ECharts / marked / DOMPurify, versioned names, cached for a year
   GET  /auth/login             start IAM Identity Center SAML login (popup)
-  POST /saml/acs               SAML assertion consumer; hands a signed session token to the iframe
+  POST /saml/acs               SAML assertion consumer; hands a session token (1 hour by default) to the iframe
+  POST /auth/logout            sign out: revoke this session token
   GET  /me                     who is signed in
   POST /chat                   submit a question: stored as a job, sent to the Runtime, which acknowledges at once
   GET  /jobs/{id}              job status, progress and result (STALLED when heartbeats stop)
@@ -24,6 +25,7 @@ import html
 import json
 import os
 import re
+import secrets
 import time
 import urllib.parse
 import uuid
@@ -47,6 +49,10 @@ NONCE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
 JOB_TTL_SECONDS = 24 * 3600
 STALE_SECONDS = 150  # the Runtime heartbeats every 30 s
+# Tool tokens (tokens.py): a job's lasts as long as the Runtime session may (maxLifetime), so long answers keep their
+# tool access after the browser's 1-hour session token expires; a button click's lasts 5 minutes.
+JOB_TOKEN_SECONDS = int(os.environ.get("JOB_TOKEN_SECONDS", "28800"))
+BUTTON_TOKEN_SECONDS = 300
 # Third-party browser scripts vendored under web/vendor (see vendor/README.md); the page needs no CDN.
 STATIC_FILES = ("echarts-6.1.0.min.js", "marked-18.1.1.umd.js", "purify-3.4.17.min.js")
 
@@ -58,20 +64,37 @@ agentcore = boto3.client("bedrock-agentcore", config=Config(read_timeout=25, con
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Optional example questions for the chat page: JSON [{"group", "tip"?, "questions": [...]}] (config.json "examples").
 EXAMPLES_JSON = os.environ.get("EXAMPLES_JSON", "") or "null"
-with open(os.path.join(HERE, "index.html"), encoding="utf-8") as page:
-    INDEX_HTML = page.read().replace("__EXAMPLES__", json.dumps(json.loads(EXAMPLES_JSON), ensure_ascii=True).replace("<", "\\u003c"))
 STATIC = {}
 for _name in STATIC_FILES:
     with open(os.path.join(HERE, "vendor", _name), encoding="utf-8") as script:
         STATIC[f"/static/{_name}"] = script.read()
+# The page's own script, under a content-hashed name so the year-long cache never serves an old version.
+with open(os.path.join(HERE, "app.js"), encoding="utf-8") as script:
+    _app = script.read()
+APP_JS = f"app-{hashlib.sha256(_app.encode('utf-8')).hexdigest()[:16]}.js"
+STATIC[f"/static/{APP_JS}"] = _app
+with open(os.path.join(HERE, "index.html"), encoding="utf-8") as page:
+    # Example questions travel as a JSON data block (not executed, so the CSP needs no inline script).
+    INDEX_HTML = page.read().replace("__APP_JS__", APP_JS).replace(
+        "__EXAMPLES__", json.dumps(json.loads(EXAMPLES_JSON), ensure_ascii=True).replace("<", "\\u003c"))
 STATIC_HEADERS = {"Content-Type": "application/javascript; charset=utf-8",
                   "Cache-Control": "public, max-age=31536000, immutable",
                   "X-Content-Type-Options": "nosniff"}
 
 SECURITY_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
-PAGE_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8",
-                "Content-Security-Policy": f"frame-ancestors 'self' {FRAME_ANCESTORS}"}
-POPUP_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "frame-ancestors 'none'"}
+# Scripts only from this origin (no inline script, no eval); styles allow 'unsafe-inline' because ECharts' tooltip
+# writes style attributes. Requests only to this API; no plugins, no <base>, no form posts.
+PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            f"connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'self' {FRAME_ANCESTORS}")
+PAGE_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP}
+
+
+def popup_headers(nonce=None):
+    """The login popup runs at most one inline script, allowed by a per-response nonce."""
+    script = f"'nonce-{nonce}'" if nonce else "'none'"
+    return {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8",
+            "Content-Security-Policy": f"default-src 'none'; script-src {script}; style-src 'unsafe-inline'; "
+                                       "base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'"}
 
 
 def _uref(sub):
@@ -114,8 +137,9 @@ def bearer(event):
 
 
 def current_user(event):
+    """The claims of the request's session token (not revoked), or None."""
     token = bearer(event)
-    return auth.verify_session(token) if token else None
+    return auth.verify_session(token, jobs) if token else None
 
 
 def acs_url(event):
@@ -126,28 +150,30 @@ def origin(event):
     return "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(acs_url(event)))
 
 
-def popup_page(title, message, payload=None, target_origin=""):
+def popup(status, title, message, payload=None, target_origin=""):
     """Login popup page; hands the session to the opener iframe on this exact origin only."""
-    script = ""
+    script, nonce = "", None
     if payload is not None:
+        nonce = secrets.token_urlsafe(18)
         data = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
-        script = ("<script>(function(){var d=" + data + ";var o=" + json.dumps(target_origin) + ";"
+        script = (f'<script nonce="{nonce}">(function(){{var d=' + data + ";var o=" + json.dumps(target_origin) + ";"
                   "if(window.opener){window.opener.postMessage(d,o);setTimeout(function(){window.close()},400);}"
                   "else{document.getElementById('m').textContent='登录成功，但无法回传到聊天窗口（弹窗与 QuickSight 页面的连接已断开）。请关闭此窗口，回到 QuickSight 重新点击登录。';}"
                   "})();</script>")
-    return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' + html.escape(title) + "</title>"
+    page = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' + html.escape(title) + "</title>"
             '<style>body{font:15px/1.6 -apple-system,"PingFang SC",sans-serif;padding:32px;color:#16232b}</style></head>'
             '<body><h3>' + html.escape(title) + '</h3><p id="m">' + html.escape(message) + "</p>" + script + "</body></html>")
+    return respond(status, page, popup_headers(nonce))
 
 
 def login_start(event):
     nonce = (event.get("queryStringParameters") or {}).get("nonce", "")
     if not NONCE.match(nonce):
-        return respond(400, popup_page("无法登录", "缺少或无效的 nonce，请从聊天窗口点击登录。"), POPUP_HEADERS)
+        return popup(400, "无法登录", "缺少或无效的 nonce，请从聊天窗口点击登录。")
     try:
         location = auth.login_redirect(jobs, nonce, acs_url(event))
     except auth.NotConfigured as error:
-        return respond(503, popup_page("尚未配置登录", f"{error}。请联系管理员按部署手册完成 Identity Center 配置。"), POPUP_HEADERS)
+        return popup(503, "尚未配置登录", f"{error}。请联系管理员按部署手册完成 Identity Center 配置。")
     return {"statusCode": 302, "headers": {**SECURITY_HEADERS, "Location": location}, "body": ""}
 
 
@@ -158,15 +184,27 @@ def login_finish(event):
                                                                  (form.get("RelayState") or [""])[0], acs_url(event))
     except auth.AuthError as error:
         print(json.dumps({"auth": "rejected", "reason": str(error)[:300]}, ensure_ascii=False))
-        return respond(403, popup_page("登录失败", str(error)), POPUP_HEADERS)
+        return popup(403, "登录失败", str(error))
     except Exception as error:  # noqa: BLE001
         print(json.dumps({"auth": "error", "error": repr(error)[:500]}, ensure_ascii=False))
-        return respond(500, popup_page("登录失败", "签名或断言校验出错，请稍后重试。"), POPUP_HEADERS)
+        return popup(500, "登录失败", "签名或断言校验出错，请稍后重试。")
     print(json.dumps({"auth": "ok", "user": _uref(payload["sub"]), "exp": payload["exp"],
                       "name_source": payload.get("name_source")}, ensure_ascii=False))
     message = {"type": "qsca-auth", "nonce": nonce, "token": token,
                "user": {"sub": payload["sub"], "name": payload["name"], "exp": payload["exp"]}}
-    return respond(200, popup_page("登录成功", "正在返回聊天窗口…", message, origin(event)), POPUP_HEADERS)
+    return popup(200, "登录成功", "正在返回聊天窗口…", message, origin(event))
+
+
+def logout(user):
+    """The 退出 button: this session token stops working at once (other browsers' sessions are not affected)."""
+    auth.revoke_session(jobs, user)
+    print(json.dumps({"auth": "logout", "user": _uref(user["sub"])}))
+    return respond(200, {"ok": True})
+
+
+def tool_token(user, analysis):
+    """A 5-minute tool token for one button click, bound to this user and analysis ("" for the analysis picker)."""
+    return auth.mint_tool_token(user["sub"], analysis, BUTTON_TOKEN_SECONDS)
 
 
 def submit(event, user):
@@ -204,14 +242,16 @@ def submit(event, user):
     now = int(time.time())
     jobs.put_item(Item={"jobId": job_id, "status": "RUNNING", "owner": user["sub"], "createdAt": now, "heartbeatAt": now,
                         "runtimeSession": runtime_session, "expiresAt": now + JOB_TTL_SECONDS})
-    # "auth" is the user's verified session token: the Runtime never shows it to the model and only attaches it to
-    # this solution's own tools, which verify it and check the user's QuickSight permissions.
+    # "auth" is a tool token for this job, not the browser's session token: bound to this user and analysis, valid
+    # for the Runtime session's maximum lifetime. The Runtime never shows it to the model and only attaches it to this
+    # solution's own tools, which verify it and check the user's QuickSight permissions.
     # "where": the page the chat is embedded in. The browser does not reveal the QuickSight page, so dashboards
     # published with `qsca publish` carry where=dashboard in the chat URL; anything else counts as the analysis.
     where = "dashboard" if body.get("where") == "dashboard" else "analysis"
     payload = {"job": {"jobId": job_id}, "prompt": prompt, "history": body.get("history") or [],
                "analysis": analysis, "parameters": body.get("parameters") or {}, "where": where,
-               "user": {"sub": user["sub"], "name": user.get("name")}, "auth": bearer(event)}
+               "user": {"sub": user["sub"], "name": user.get("name")},
+               "auth": auth.mint_tool_token(user["sub"], analysis, JOB_TOKEN_SECONDS, jti=job_id)}
     try:
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=RUNTIME_ARN, runtimeSessionId=runtime_session, contentType="application/json",
@@ -285,7 +325,7 @@ def apply_change(change_id, event, user):
     if not HEX32.match(change_id) or not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
         return respond(400, {"error": "invalid change"})
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(
-        {"__tool": "apply_pending_change", "pending_change_id": change_id, "_caller": bearer(event),
+        {"__tool": "apply_pending_change", "pending_change_id": change_id, "_caller": tool_token(user, analysis),
          "_analysis": analysis}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     print(json.dumps({"change": change_id, "user": _uref(user["sub"]), "event": "apply", "ok": "error" not in result,
@@ -308,12 +348,13 @@ def publish_dashboards(event, user):
 
 def run_button_tool(event, user, tool, analysis=None, extra=None):
     """Button-only analysis tools (never the model): the analysis-tools Lambda checks this user's permissions."""
-    payload = {"__tool": tool, "_caller": bearer(event),
-               "_chat_url": f"https://{event.get('requestContext', {}).get('domainName', '')}", **(extra or {})}
+    payload = {"__tool": tool, "_chat_url": f"https://{event.get('requestContext', {}).get('domainName', '')}",
+               **(extra or {})}
     if analysis is not None:
         if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
             return respond(400, {"error": "invalid analysis"})
         payload["_analysis"] = analysis
+    payload["_caller"] = tool_token(user, analysis)
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(payload).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     if tool == "bind_chat":
@@ -325,7 +366,7 @@ def run_button_tool(event, user, tool, analysis=None, extra=None):
 def run_publish(event, user, analysis):
     domain = event.get("requestContext", {}).get("domainName", "")
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(
-        {"__tool": "publish_dashboards", "_caller": bearer(event), "_analysis": analysis,
+        {"__tool": "publish_dashboards", "_caller": tool_token(user, analysis), "_analysis": analysis,
          "_chat_url": f"https://{domain}"}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     print(json.dumps({"user": _uref(user["sub"]), "event": "publish_dashboards", "ok": "error" not in result,
@@ -376,6 +417,8 @@ def handler(event, context):
         return respond(401, {"error": "unauthorized", "login": True})
     if method == "GET" and path == "/me":
         return respond(200, {"sub": user["sub"], "name": user.get("name"), "exp": user["exp"]})
+    if method == "POST" and path == "/auth/logout":
+        return logout(user)
     if method == "POST" and path == "/chat":
         return submit(event, user)
     if method == "POST" and re.fullmatch(r"/changes/[0-9a-f]{32}/apply", path):

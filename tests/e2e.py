@@ -7,7 +7,8 @@
 --visual (a line or bar chart) enables the preview/apply/undo test; --dataset with --control-column (a column a
 control lists values from) enables the control-suggestion test. The chart question assumes nothing about the data.
 
-Checks: auth rejections; a data question answered with a chart; pandas calculations in the sandbox; control
+Checks: auth (rejections, session vs tool token audiences, tool token bound to the analysis, sign-out revocation,
+page CSP); a data question answered with a chart; pandas calculations in the sandbox; control
 suggestions; preview -> apply (owner only, once) -> undo; add / retitle / delete a visual then undo all three; fast
 cancel; refusal for an unknown user. Edits are always undone, leaving the analysis as it was.
 """
@@ -45,7 +46,15 @@ class Client:
         self.analysis = args.analysis
 
     def token(self, email):
+        """A browser session token (what the page holds after sign-in)."""
         return qsca.mint_token(self.session, self.out["SessionSecretName"], email)
+    def tool_token(self, email, analysis):
+        """A tool token (what the web Lambda gives the Runtime or a button call), for invoking tool Lambdas directly."""
+        return qsca.mint_token(self.session, self.out["SessionSecretName"], email, analysis=analysis)
+    def invoke_tool(self, function_output, payload):
+        response = self.session.client("lambda").invoke(FunctionName=self.out[function_output],
+                                                        Payload=json.dumps(payload).encode())
+        return json.loads(response["Payload"].read() or b"{}")
 
     def ask(self, token, prompt, parameters=None, session=None, wait=True):
         status, job = qsca.http("POST", f"{self.base}/chat", token, {
@@ -96,11 +105,36 @@ def tools(result):
 
 
 def test_auth(c, args):
+    """Read-only: token audiences, analysis binding, sign-out revocation, page CSP, login redirect."""
     print("==> auth")
     for label, header in (("no token", None), ("forged token", "x.y")):
         status, _ = qsca.http("POST", f"{c.base}/chat", header or "", {"prompt": "hi", "analysis": c.analysis})
         check(f"{label} -> 401", status == 401, status)
+    status, _ = qsca.http("GET", f"{c.base}/me", c.tool_token(args.editor, c.analysis))
+    check("tool token refused by the web API -> 401", status == 401, status)
+    describe = {"__tool": "describe_analysis", "_analysis": c.analysis}
+    result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.token(args.editor)})
+    check("session token refused by the tool Lambda", result.get("error") == "用户身份校验失败", result.get("error"))
+    result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.tool_token(args.editor, "some-other-analysis")})
+    check("tool token for another analysis refused", "不是为这个分析签发的" in str(result.get("error")), result.get("error"))
+    result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.tool_token(args.editor, c.analysis)})
+    check("tool token for this analysis accepted", result.get("analysis_id") == c.analysis, result.get("error"))
+    session = c.token(args.editor)
+    before, _ = qsca.http("GET", f"{c.base}/me", session)
+    out, _ = qsca.http("POST", f"{c.base}/auth/logout", session, {})
+    after, _ = qsca.http("GET", f"{c.base}/me", session)
+    check("sign-out revokes the session token (200, 200 -> 401)", (before, out, after) == (200, 200, 401), (before, out, after))
+    import re
     import urllib.request
+    with urllib.request.urlopen(f"{c.base}/", timeout=30, context=qsca.tls_context()) as response:
+        csp, page = response.headers.get("Content-Security-Policy", ""), response.read().decode("utf-8")
+    script = re.search(r'<script src="(/static/app-[0-9a-f]{16}\.js)"', page)
+    inline = [s for s in re.findall(r"<script([^>]*)>", page) if "src=" not in s and 'type="application/json"' not in s]
+    check("page CSP: scripts only from this origin", "script-src 'self';" in csp and "default-src 'none'" in csp, csp)
+    check("page has no inline script and loads app.js", script is not None and not inline, (bool(script), inline))
+    if script:
+        with urllib.request.urlopen(c.base + script.group(1), timeout=30, context=qsca.tls_context()) as response:
+            check("app.js served", response.status == 200 and b"startSession" in response.read(), response.status)
     request = urllib.request.Request(f"{c.base}/auth/login?nonce={uuid.uuid4().hex}", method="GET")
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -181,10 +215,9 @@ def test_controls(c, args):
         return
     token = c.token(args.editor)
     station = None
-    data = c.session.client("lambda").invoke(FunctionName=c.out["DataToolsFunction"], Payload=json.dumps({
-        "__tool": "distinct_values", "_caller": token, "_analysis": c.analysis, "dataset_id": args.dataset,
-        "column": args.control_column}).encode())
-    values = json.loads(data["Payload"].read()).get("values") or []
+    values = c.invoke_tool("DataToolsFunction", {
+        "__tool": "distinct_values", "_caller": c.tool_token(args.editor, c.analysis), "_analysis": c.analysis,
+        "dataset_id": args.dataset, "column": args.control_column}).get("values") or []
     station = values[0] if values else None
     check(f"distinct_values on {args.control_column}", bool(station), values[:3])
     if not station:

@@ -284,7 +284,7 @@ def _chat_base(args):
 def bindable_analyses(args):
     """For an unbound chat visual: recently updated analyses this user may edit (the one being edited is usually
     first, since adding the visual just updated it), and which of them already contain an unbound chat."""
-    email = caller.verify_token(args.get("_caller"))
+    email = caller.verify_token(args.get("_caller"), "")  # issued for the picker, not for one analysis
     base = _chat_base(args)
     arns = caller.principals(email)
     summaries = [a for a in caller._paged(qs.list_analyses, "AnalysisSummaryList")

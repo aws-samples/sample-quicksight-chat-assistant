@@ -13,9 +13,10 @@ Model: OpenAI-compatible endpoint from the Secrets Manager secret LLM_SECRET_ID 
  "max_retries": 4, "params": {...extra Chat Completions fields, e.g. "reasoning_effort": "medium"}}.
 Amazon Bedrock works directly: base_url https://bedrock-runtime.<region>.amazonaws.com/openai/v1 with a Bedrock API key.
 
-Tools: everything on the AgentCore Gateway. Calls to this solution's own targets (TRUSTED_TARGETS) carry the user's
-signed session token, the analysis id and the current control values, added here in code (WithCaller) - the model
-neither sees nor sets them. Other targets (an enterprise MCP such as DataHub or Metabase) get nothing extra.
+Tools: everything on the AgentCore Gateway. Calls to this solution's own targets (TRUSTED_TARGETS) carry the job's
+tool token ("auth": issued by the web Lambda for this user and analysis, valid for the session's maxLifetime; not the
+browser's session token), the analysis id and the current control values, added here in code (WithCaller) - the
+model neither sees nor sets them. Other targets (an enterprise MCP such as DataHub or Metabase) get nothing extra.
 Local tools: plot_result, preview_analysis_change, analyze_result (pandas in a no-network Code Interpreter
 sandbox), suggest_controls. Chart numbers always come from tool results.
 """
@@ -232,7 +233,9 @@ def undo_command(prompt):
 DASHBOARD_EDIT_MESSAGE = ("这里是已发布的仪表盘，在这里修改或撤销都不会让仪表盘变化。请到对应的分析里操作，"
                           "改完后重新发布仪表盘。")
 DASHBOARD_PROMPT = ("当前页面是已发布的仪表盘，不是分析：仪表盘不会随分析的修改而变化，你也没有修改工具。用户要改图表、"
-                    "改标题、新增或删除图表、撤销时，直接告诉用户：" + DASHBOARD_EDIT_MESSAGE + "\n")
+                    "改标题、新增或删除图表、撤销时，直接告诉用户：" + DASHBOARD_EDIT_MESSAGE + "\n"
+                    "仪表盘里没有“管理”和“☆ 加入示例”：给出示例问题后，告诉用户示例问题要由分析的编辑者在对应的分析里点“管理”设置，"
+                    "分析和由它发布的仪表盘共用同一套；不要让用户在这里点“管理”。\n")
 
 
 def run_undo(mcp, injected, force):

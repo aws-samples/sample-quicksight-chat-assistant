@@ -35,6 +35,8 @@ export interface AppConfig {
   };
   mcpTargets: McpTargetConfig[];
   runtime: { idleSeconds: number; maxLifetimeSeconds: number };
+  /** Optional: how long a browser sign-in lasts, in seconds (default 3600; 300-43200). */
+  sessionSeconds?: number;
   api: { rateLimit: number; burstLimit: number };
   frameAncestors: string;
   /** Optional example questions shown in the chat page, replacing the built-in generic ones. */
@@ -54,6 +56,10 @@ export function loadConfig(path: string): AppConfig {
       problems.push(`mcpTargets.name "${target.name}": letters, digits, hyphens; "analysis" and "data" are reserved`);
     }
     if (!target.endpoint?.startsWith('https://')) problems.push(`mcpTargets "${target.name}": endpoint must be https://`);
+  }
+  const session = config.sessionSeconds;
+  if (session !== undefined && !(Number.isInteger(session) && session >= 300 && session <= 43200)) {
+    problems.push('sessionSeconds: whole seconds between 300 and 43200 (default 3600)');
   }
   const examples = Buffer.byteLength(JSON.stringify(config.examples ?? []), 'utf8');
   if (examples > 2500) problems.push(`examples: ${examples} bytes as JSON; keep under 2500 (Lambda environment variables share a 4 KB limit)`);

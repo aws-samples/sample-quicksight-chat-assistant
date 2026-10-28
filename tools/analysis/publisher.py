@@ -74,17 +74,22 @@ def publish_definition(dashboard_id, name, definition, options, description, ana
 
 def ids_from(event):
     """(dashboard id, analysis id or "") from an EventBridge CloudTrail event. Console publishes arrive as service
-    events naming the analysis; API calls (e.g. qsca publish) carry only the dashboard id."""
+    events naming the analysis: a republish (UpdateDashboard) has the dashboard in eventRequestDetails, a first
+    publish (CreateDashboard) only in eventResponseDetails. API calls (e.g. qsca publish) carry only the dashboard id."""
     detail = event.get("detail") or {}
     request = detail.get("requestParameters") or {}
-    service = (detail.get("serviceEventDetails") or {}).get("eventRequestDetails") or {}
-    dashboard = request.get("dashboardId") or str(service.get("dashboardId") or "").rsplit("/", 1)[-1]
-    return dashboard, str(service.get("analysisId") or "").rsplit("/", 1)[-1]
+    service = detail.get("serviceEventDetails") or {}
+    asked, answered = service.get("eventRequestDetails") or {}, service.get("eventResponseDetails") or {}
+    dashboard = request.get("dashboardId") or str(asked.get("dashboardId") or answered.get("dashboardId") or "").rsplit("/", 1)[-1]
+    return dashboard, str(asked.get("analysisId") or "").rsplit("/", 1)[-1]
 
 
 def handler(event, _context):
     dashboard_id, analysis_id = ids_from(event)
     if not dashboard_id:
+        detail = event.get("detail") or {}
+        log(event="dashboard_mark_skipped", reason="no dashboard id in the event", event_name=detail.get("eventName"),
+            event_type=detail.get("eventType"))
         return {"skipped": "no dashboard id"}
     # The latest version, not the published one: our own UpdateDashboard triggers this again before its version is
     # published, and that newer version is already marked.

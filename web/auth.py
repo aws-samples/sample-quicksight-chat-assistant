@@ -1,18 +1,19 @@
-"""IAM Identity Center SAML 2.0 (SP-initiated) login and HMAC session tokens for the chat page.
+"""IAM Identity Center SAML 2.0 (SP-initiated) login, session tokens and tool tokens for the chat page.
 
 The Identity Center application metadata (XML) is read from the SSM parameter IDP_METADATA_PARAMETER on first use,
-so it can be set after deployment (`./qsca idp-metadata <file>`) without redeploying. The signing key is derived from
-the Secrets Manager secret SESSION_SECRET_ID (any random string; tools/common/caller.py derives it the same way).
+so it can be set after deployment (`./qsca idp-metadata <file>`) without redeploying. Tokens are JWTs signed with
+HS256 by PyJWT (tools/common/tokens.py, shared with the tool Lambdas); the key is derived from the Secrets Manager
+secret SESSION_SECRET_ID.
 
 Flow: the chat iframe opens a popup at /auth/login?nonce=..., which redirects to Identity Center with an
 AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the popup hands a
-signed session token back to the iframe with postMessage, restricted to this origin and matched by nonce.
+session token (1 hour by default) back to the iframe with postMessage, restricted to this origin and matched by
+nonce. Sign-out revokes the session token (its jti is stored until it would have expired). Tool calls never use the
+session token: the web Lambda issues a separate tool token per job or button click (see tokens.py).
 """
 
 import base64
 import datetime as dt
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -27,6 +28,8 @@ from lxml import etree
 from signxml import XMLVerifier
 from signxml.exceptions import SignXMLException
 
+import tokens
+
 NS = {
     "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
     "saml": "urn:oasis:names:tc:SAML:2.0:assertion",
@@ -36,7 +39,7 @@ NS = {
 SP_ENTITY_ID = os.environ["SAML_SP_ENTITY_ID"]
 SESSION_SECRET_ID = os.environ["SESSION_SECRET_ID"]
 IDP_METADATA_PARAMETER = os.environ["IDP_METADATA_PARAMETER"]
-SESSION_SECONDS = int(os.environ.get("SESSION_SECONDS", str(8 * 3600)))
+SESSION_SECONDS = int(os.environ.get("SESSION_SECONDS", "3600"))
 LOGIN_SECONDS = 600
 CLOCK_SKEW = dt.timedelta(minutes=3)
 SAFE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False, remove_comments=True)
@@ -60,16 +63,20 @@ def parse_idp_metadata(xml_bytes):
     certs = root.xpath("//md:IDPSSODescriptor/md:KeyDescriptor[not(@use) or @use='signing']//ds:X509Certificate/text()", namespaces=NS)
     if not (entity_id and redirect and certs):
         raise RuntimeError("Identity Center metadata is missing entityID, redirect binding or signing certificate")
-    body = "".join(certs[0].split())
-    pem = "-----BEGIN CERTIFICATE-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64)) + "\n-----END CERTIFICATE-----\n"
-    return entity_id, redirect[0], pem
+    pems = []
+    for cert in certs:  # every signing certificate: during a certificate rotation the metadata lists old and new
+        body = "".join(cert.split())
+        pem = "-----BEGIN CERTIFICATE-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64)) + "\n-----END CERTIFICATE-----\n"
+        if pem not in pems:
+            pems.append(pem)
+    return entity_id, redirect[0], pems
 
 
 _idp = {}
 
 
 def idp():
-    """(entity id, SSO redirect URL, signing certificate PEM), loaded from SSM and cached for 5 minutes."""
+    """(entity id, SSO redirect URL, [signing certificate PEM]), loaded from SSM and cached for 5 minutes."""
     if not _idp or time.time() - _idp["at"] > 300:
         ssm = boto3.client("ssm")
         try:
@@ -87,43 +94,40 @@ def _key():
     global _session_key
     if _session_key is None:
         raw = boto3.client("secretsmanager").get_secret_value(SecretId=SESSION_SECRET_ID)["SecretString"]
-        if len(raw) < 32:
-            raise RuntimeError("session key too short")
-        _session_key = hashlib.sha256(raw.encode("utf-8")).digest()
+        _session_key = tokens.signing_key(raw)
     return _session_key
 
 
-def _b64u(data):
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _b64u_decode(text):
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+def _revoked_key(jti):
+    return {"jobId": f"revoked#{jti}"}
 
 
 def mint_session(subject, name):
-    now = int(time.time())
-    payload = {"sub": subject, "name": name, "iat": now, "exp": now + SESSION_SECONDS, "jti": uuid.uuid4().hex}
-    body = _b64u(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    signature = _b64u(hmac.new(_key(), body.encode("ascii"), hashlib.sha256).digest())
-    return f"{body}.{signature}", payload
+    """The browser's session token after a validated SAML login: (token, claims)."""
+    return tokens.mint(_key(), tokens.SESSION_AUDIENCE, subject, SESSION_SECONDS, name=name)
 
 
-def verify_session(token):
-    """Return the session payload, or None when the token is missing, forged or expired."""
-    if not token or token.count(".") != 1 or len(token) > 2048:
-        return None
-    body, signature = token.split(".")
-    expected = _b64u(hmac.new(_key(), body.encode("ascii"), hashlib.sha256).digest())
-    if not hmac.compare_digest(signature, expected):
-        return None
+def verify_session(token, table):
+    """Return the session claims, or None when the token is missing, forged, expired, meant for the tools, or
+    revoked by sign-out."""
     try:
-        payload = json.loads(_b64u_decode(body))
-    except ValueError:
+        claims = tokens.verify(_key(), token, tokens.SESSION_AUDIENCE)
+    except tokens.InvalidToken:
         return None
-    if not isinstance(payload, dict) or int(payload.get("exp", 0)) <= time.time():
+    if table.get_item(Key=_revoked_key(claims["jti"]), ConsistentRead=True).get("Item"):
         return None
-    return payload
+    return claims
+
+
+def revoke_session(table, claims):
+    """Sign-out: the session token stops working at once; the record expires (TTL) when the token would have."""
+    table.put_item(Item={**_revoked_key(claims["jti"]), "createdAt": int(time.time()),
+                         "expiresAt": int(claims["exp"]) + tokens.LEEWAY_SECONDS + 60})
+
+
+def mint_tool_token(subject, analysis, seconds, jti=None):
+    """A token for the analysis/data tool Lambdas, bound to this user and analysis ("" for the analysis picker)."""
+    return tokens.mint(_key(), tokens.TOOLS_AUDIENCE, subject, seconds, jti=jti, analysis=analysis or "")[0]
 
 
 def login_redirect(table, nonce, acs_url):
@@ -160,6 +164,18 @@ def _verified_assertion(response_xml):
         raise AuthError("SAMLResponse is not well-formed XML") from error
 
 
+def _verify_with_idp_certs(xml):
+    """Verify the XML signature against each Identity Center signing certificate in turn (old and new during a
+    rotation); signxml ignores any key in the document itself. Returns the element the signature covers."""
+    error = None
+    for pem in idp()[2]:
+        try:
+            return XMLVerifier().verify(xml, x509_cert=pem, ignore_ambiguous_key_info=True).signed_xml
+        except SignXMLException as failure:
+            error = failure
+    raise error
+
+
 def _verify_signature(response_xml):
     root = etree.fromstring(response_xml, SAFE_PARSER)
     if root.tag != f"{{{NS['samlp']}}}Response":
@@ -167,11 +183,10 @@ def _verify_signature(response_xml):
     assertions = root.findall("saml:Assertion", NS)
     if len(assertions) != 1 or root.findall(".//saml:EncryptedAssertion", NS):
         raise AuthError("expected exactly one plain assertion")
-    verifier = XMLVerifier()
     if assertions[0].find("ds:Signature", NS) is not None:
-        signed = verifier.verify(etree.tostring(assertions[0]), x509_cert=idp()[2], ignore_ambiguous_key_info=True).signed_xml
+        signed = _verify_with_idp_certs(etree.tostring(assertions[0]))
     elif root.find("ds:Signature", NS) is not None:
-        signed_root = verifier.verify(response_xml, x509_cert=idp()[2], ignore_ambiguous_key_info=True).signed_xml
+        signed_root = _verify_with_idp_certs(response_xml)
         inner = signed_root.findall("saml:Assertion", NS)
         if len(inner) != 1:
             raise AuthError("signed response does not contain exactly one assertion")
@@ -237,6 +252,8 @@ def complete_login(table, saml_response_b64, relay_state, acs_url):
     if not subject or len(subject) > 256:
         raise AuthError("missing NameID")
     assertion_id = assertion.get("ID") or ""
+    if not assertion_id or len(assertion_id) > 256:
+        raise AuthError("assertion has no valid ID")
     try:
         table.put_item(Item={"jobId": f"samlassert#{assertion_id}", "createdAt": int(time.time()),
                              "expiresAt": int(time.time()) + 24 * 3600},

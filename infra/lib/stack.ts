@@ -277,6 +277,8 @@ export class ChatAssistantStack extends Stack {
         IDP_METADATA_PARAMETER: idpParameter, SAML_SP_ENTITY_ID: config.identityCenter.samlEntityId,
         FRAME_ANCESTORS: config.frameAncestors, EXAMPLES_JSON: JSON.stringify(config.examples ?? []),
         IDENTITY_STORE_ID: config.identityCenter.identityStoreId ?? '', IDENTITY_CENTER_REGION: identityRegion,
+        // Browser sign-in lifetime; a job's tool token lives as long as its Runtime session may.
+        SESSION_SECONDS: String(config.sessionSeconds ?? 3600), JOB_TOKEN_SECONDS: String(config.runtime.maxLifetimeSeconds),
       },
       description: 'Chat page, IAM Identity Center SAML login and job API for the QuickSight chat assistant.',
     });

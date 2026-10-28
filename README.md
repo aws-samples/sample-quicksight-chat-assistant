@@ -48,7 +48,7 @@ QuickSight analysis / dashboard
 API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB (jobs, sign-in state, pending edits)
                          │ │                                           ▲ heartbeats / result
                          │ └─ sign-in: Identity Center identity store (read the user's name by email)
-                         │ submit job (returns at once)                │
+                         │ submit job + tool token (returns at once)   │
                          ▼                                             │
                   AgentCore Runtime: Strands agent (one microVM per session)
                          │  ├─ local tools: plot_result, preview_analysis_change, suggest_controls
@@ -64,17 +64,18 @@ Model: your OpenAI-compatible endpoint, e.g. Bedrock bedrock-runtime /openai/v1 
 ```
 
 Everything is one CDK stack in the QuickSight region. The `Apply` button calls the web Lambda, which invokes the
-analysis tools Lambda directly as that user; the model can preview and undo edits but can never apply them.
+analysis tools Lambda directly as that user (with a 5-minute tool token); the model can preview and undo edits but can
+never apply them.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | `agent/` | Runtime agent (Strands): jobs, heartbeats, cancel, charts (`charts.py`), sandbox (`sandbox.py`), prompt |
-| `web/` | Web Lambda: chat page, SAML login, job API, apply endpoint; `web/vendor/` ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17 (pinned copies with npm integrity, see `web/vendor/README.md`; no CDN) |
+| `web/` | Web Lambda: chat page (`index.html` + `app.js`, no inline script), SAML login, job API, apply endpoint; `web/vendor/` ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17 (pinned copies with npm integrity, see `web/vendor/README.md`; no CDN) |
 | `tools/analysis/` | Gateway tools: describe the analysis, preview / apply / undo edits; button-only tools (publish, bind, example questions); `publisher.py` marks the chat in published dashboards |
 | `tools/data/` | Gateway tools: describe datasets, structured aggregate queries, distinct values |
-| `tools/common/` | Shared: caller verification and QuickSight permission checks, definition parsing, edit operations |
+| `tools/common/` | Shared: signed tokens (`tokens.py`, also used by the web Lambda and `qsca`), caller verification and QuickSight permission checks, definition parsing, edit operations |
 | `infra/` | CDK (TypeScript) stack |
 | `qsca` | CLI: build, deploy, configure, attach, publish, check, smoke test |
 | `tests/` | Unit tests (`tests/unit`) and the deployed end-to-end suite (`tests/e2e.py`) |
@@ -86,9 +87,9 @@ analysis tools Lambda directly as that user; the model can preview and undo edit
 | Item | Requirement |
 |---|---|
 | AWS | Account and the QuickSight region (cn-north-1 verified); admin-level deploy permissions |
-| QuickSight | Enterprise edition, users sign in through IAM Identity Center; QuickSight user emails match Identity Center emails |
+| QuickSight | Enterprise edition, users sign in through IAM Identity Center; QuickSight user emails match Identity Center emails, one active QuickSight user per email |
 | Model | OpenAI-compatible Chat Completions endpoint with tool calling and streaming, reachable from the Runtime over public HTTPS (Amazon Bedrock, OpenAI-compatible providers, or a gateway such as LiteLLM for other APIs) |
-| Machine | macOS or Linux, Node.js 20+, Python 3.9+ with `pip` and `boto3`, access to npm and PyPI (mirrors work: `npm config set registry …`, `PIP_INDEX_URL`). No Docker needed |
+| Machine | macOS or Linux, Node.js 20+, Python 3.9+ with `pip`, `boto3` and `PyJWT` (`PyJWT` only for `qsca smoke` and the tests), access to npm and PyPI (mirrors work: `npm config set registry …`, `PIP_INDEX_URL`). No Docker needed |
 | CDK bootstrap | Once per account/region: `cd infra && npm ci && npx cdk bootstrap aws://<account>/<region>` |
 
 ### 1. Configure
@@ -110,7 +111,8 @@ cp config.example.json config.json
 | `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets (default `quicksight-chat-assistant/datasource/`) |
 | `dataAccess.extraSecretArns` | Secrets used by QuickSight data sources themselves, if you want to reuse them |
 | `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
-| `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job) |
+| `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job and how long a job's tool token lasts) |
+| `sessionSeconds` | Optional: how long a browser sign-in lasts, 300-43200 seconds (default 3600 = 1 h) |
 | `api.rateLimit` / `burstLimit` | HTTP API throttling |
 | `frameAncestors` | Origins allowed to embed the chat page (the QuickSight console domains of your region) |
 | `examples` | Optional example questions for the chat page, replacing the built-in generic ones: `[{"group": "…", "tip": "…", "questions": ["…"]}]`, at most 2500 bytes as JSON. Use it to tailor a demo to your data. Groups with `"edit": true` (or named 修改…) are hidden in dashboards |
@@ -275,8 +277,9 @@ refresh. Administrators can still do the same from the command line with `./qsca
 ### Customize the example questions
 
 The **示例问题** bar under the input box shows the deployment default until an analysis has its own set: one
-question that fits any analysis, or the groups in `examples` of `config.json` if the administrator set them. Editors of the analysis maintain that set in the chat; viewers of the analysis and
-of the dashboards published from it see it (groups whose name contains 修改 are hidden in dashboards).
+question that fits any analysis, or the groups in `examples` of `config.json` if the administrator set them. Editors of the analysis maintain that set in the analysis' chat; viewers of the analysis and
+of the dashboards published from it see it (groups whose name contains 修改 are hidden in dashboards). A dashboard is
+for using what was published: its chat has no **管理** or **☆ 加入示例**.
 
 - **☆ 加入示例** under any question you asked adds it to the group 常用问题 (the first time, the default examples
   shown at that moment are kept next to it).
@@ -291,7 +294,8 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 ### Ask and edit
 
 1. Open an analysis or dashboard with the assistant, click **Sign in with Identity Center** (usually no password when
-   already signed in to QuickSight). The session lasts 8 hours. Example questions sit in the collapsed **示例问题** bar
+   already signed in to QuickSight). A sign-in lasts 1 hour (`sessionSeconds`); when it expires, sign in again and the
+   conversation continues, including an answer that was still running. **退出** signs out at once. Example questions sit in the collapsed **示例问题** bar
    under the input box, one tab per group; clicking one asks it.
 2. Ask, for example:
    - *Which visuals does this analysis have and what do they show?*
@@ -314,14 +318,16 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 
 | Topic | Mechanism |
 |---|---|
-| Sign-in | Only users assigned to the Identity Center app; SAML assertions checked for signature, audience, ACS, validity and replay |
-| Session | HMAC-signed token, 8 hours, stored in the iframe's browser storage |
-| Who sees data | Users must be able to view the analysis or a dashboard published from it; only that analysis' datasets can be queried |
+| Sign-in | Only users assigned to the Identity Center app; SAML assertions checked for signature (against every signing certificate in the app metadata, so a certificate rotation keeps working), issuer, audience, ACS, request ID, validity and replay; assertions without an ID are refused |
+| Session | JWT signed with HS256 (PyJWT), 1 hour by default (`sessionSeconds`), stored in the iframe's browser storage; accepted only by the web Lambda; **退出** revokes it on the server at once |
+| Chat page | Content-Security-Policy: scripts only from the page's own origin (no inline script), requests only to its API, no plugins or form posts, embeddable only by `frameAncestors`; styles allow inline (ECharts tooltips). Model answers are sanitized with DOMPurify, without images, iframes or styles |
+| Who sees data | Users must be able to view the analysis or a dashboard published from it; only that analysis' datasets can be queried. The signed-in email must match exactly one active QuickSight user (several are refused, not merged) |
 | Dataset rules | Datasets with row-level security, dataset filters or joins are refused (querying the source would bypass them); columns under column-level security are hidden from users not granted them |
 | Queries | The model never writes SQL: structured requests, column names checked against the dataset, fixed aggregates and operators, bound parameters, read-only transaction, 20 s timeout, at most 500 rows |
 | Sandbox | Code Interpreter in SANDBOX network mode, no execution role: it only receives result rows the user could already query |
 | Who edits | `quicksight:UpdateAnalysis` on that analysis for the user (QuickSight sharing); apply only by the requester, once, within 10 minutes; the previous definition is backed up to S3 before every change |
-| Identity to tools | The Runtime adds the verified token to this solution's own tool calls in code; the model cannot see or forge it; enterprise MCP servers do not get it |
+| Identity to tools | Tools never get the browser's token. The web Lambda issues a tool token per job (bound to the user and the analysis, valid as long as the Runtime session may run) or per button click (5 minutes); the Runtime adds it to this solution's own tool calls in code; the model cannot see or forge it; enterprise MCP servers do not get it. Tool Lambdas refuse session tokens and tokens issued for another analysis |
+| Permission changes | QuickSight users, groups and sharing are cached up to 60 s, so a removed share or group membership takes effect within a minute; the list of dashboards published from an analysis is cached 5 minutes (a dashboard republished from another analysis keeps its viewers' access to the old analysis that long) |
 | Data flow | Questions and results go to your model endpoint; CloudWatch logs never contain tokens or passwords, and do not log the sign-in email (a non-reversible per-user reference is used instead), the SAML attributes, or model-output text (only sizes/counts for diagnostics) |
 
 SPICE datasets: built-in queries read the current source data, which may be newer than the last SPICE refresh (the
@@ -346,6 +352,8 @@ the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing
 | Answers are slow | Runtime log event `answered` has `setup_ms`, `tool_ms` and `model_ms` per call; repeated failed tool calls or slow model calls show there |
 | The chat shows the email, not the name | Log `name_lookup_failed` in the web Lambda: user not in the identity store, or Identity Center in another account / region (set `identityCenter.identityStoreId` / `region`) |
 | No permission for the analysis | The user cannot view it in QuickSight, or the emails differ |
+| "QuickSight 里有 N 个活跃用户使用同一个邮箱" | Several active QuickSight users share the email (e.g. the same person federated through two IAM roles); deactivate or delete the extra users |
+| Asked to sign in again after an hour | Expected: a sign-in lasts `sessionSeconds` (default 1 h); the conversation continues after signing in |
 | Missing database credentials | Create the data source secret (step 5) |
 | Built-in query does not support a dataset | RLS, dataset filters, joins, or an unsupported source; add an enterprise MCP server |
 | Query timeout / connection error | Database security group or routing does not allow the data tools Lambda |
@@ -376,8 +384,11 @@ ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-nort
 ./qsca build
 ```
 
+The unit tests need `boto3` and `PyJWT`; the SAML tests in `tests/unit/test_auth.py` also need `signxml`, `lxml` and
+`cryptography` at the pinned versions below (skipped otherwise).
+
 Pinned: strands-agents 1.61.1, bedrock-agentcore 1.24.2, boto3 1.43.115, signxml 5.2.0, lxml 6.1.3,
-cryptography 50.0.2, pg8000 1.31.5, PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17.
+cryptography 50.0.2, PyJWT 2.15.1, pg8000 1.31.5 (with scramp 1.4.18), PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17.
 
 ---
 
@@ -420,7 +431,7 @@ QuickSight 分析 / 仪表盘
 API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB（任务、登录状态、待确认修改）
                          │ │                                           ▲ 心跳 / 结果
                          │ └─ 登录：Identity Center 用户目录（按邮箱读取用户姓名）
-                         │ 提交任务（立即返回）                        │
+                         │ 提交任务 + 工具令牌（立即返回）             │
                          ▼                                             │
                   AgentCore Runtime：Strands Agent（每个会话一个 microVM）
                          │  ├─ 本地工具：plot_result、preview_analysis_change、suggest_controls
@@ -435,18 +446,18 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
 模型：你的 OpenAI 兼容端点，如 Bedrock bedrock-runtime /openai/v1（地址和 Key 存在 Secrets Manager）
 ```
 
-所有资源在 QuickSight 所在区域的一个 CDK 栈里。“应用到分析”按钮调用 Web Lambda，由它以该用户身份直接调用分析工具 Lambda；
-模型可以预览和撤销修改，但永远不能应用修改。
+所有资源在 QuickSight 所在区域的一个 CDK 栈里。“应用到分析”按钮调用 Web Lambda，由它以该用户身份（带 5 分钟的工具令牌）直接调用
+分析工具 Lambda；模型可以预览和撤销修改，但永远不能应用修改。
 
 ## 仓库结构
 
 | 路径 | 内容 |
 |---|---|
 | `agent/` | Runtime 上的 Agent（Strands）：任务、心跳、取消、图表（`charts.py`）、沙箱（`sandbox.py`）、提示词 |
-| `web/` | Web Lambda：聊天页、SAML 登录、任务 API、应用接口；`web/vendor/` 下是 ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17（固定版本，带 npm 完整性校验，见 `web/vendor/README.md`；不用 CDN） |
+| `web/` | Web Lambda：聊天页（`index.html` + `app.js`，没有内联脚本）、SAML 登录、任务 API、应用接口；`web/vendor/` 下是 ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17（固定版本，带 npm 完整性校验，见 `web/vendor/README.md`；不用 CDN） |
 | `tools/analysis/` | Gateway 工具：描述分析、预览 / 应用 / 撤销修改；仅由按钮触发的工具（发布、绑定、示例问题）；`publisher.py` 给已发布仪表盘里的聊天打标记 |
 | `tools/data/` | Gateway 工具：描述数据集、结构化聚合查询、去重取值 |
-| `tools/common/` | 公共代码：调用者校验与 QuickSight 权限检查、定义解析、修改操作 |
+| `tools/common/` | 公共代码：签名令牌（`tokens.py`，web Lambda 和 `qsca` 也使用）、调用者校验与 QuickSight 权限检查、定义解析、修改操作 |
 | `infra/` | CDK（TypeScript）栈 |
 | `qsca` | 命令行：构建、部署、配置、接入、发布、检查、冒烟测试 |
 | `tests/` | 单元测试（`tests/unit`）和针对已部署环境的端到端测试（`tests/e2e.py`） |
@@ -458,9 +469,9 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
 | 项目 | 要求 |
 |---|---|
 | AWS | 账号和 QuickSight 所在区域（已验证 cn-north-1）；管理员级部署权限 |
-| QuickSight | 企业版，用户通过 IAM Identity Center 登录；QuickSight 用户邮箱与 Identity Center 邮箱一致 |
+| QuickSight | 企业版，用户通过 IAM Identity Center 登录；QuickSight 用户邮箱与 Identity Center 邮箱一致，且每个邮箱只对应一个活跃的 QuickSight 用户 |
 | 模型 | OpenAI 兼容的 Chat Completions 端点，支持工具调用和流式输出，Runtime 能经公网 HTTPS 访问（Amazon Bedrock、各家 OpenAI 兼容接口，或用 LiteLLM 等网关转换其他接口） |
-| 部署机器 | macOS 或 Linux，Node.js 20+，Python 3.9+（带 `pip` 和 `boto3`），能访问 npm 和 PyPI（可用镜像：`npm config set registry …`、`PIP_INDEX_URL`）。不需要 Docker |
+| 部署机器 | macOS 或 Linux，Node.js 20+，Python 3.9+（带 `pip`、`boto3` 和 `PyJWT`；`PyJWT` 只有 `qsca smoke` 和测试需要），能访问 npm 和 PyPI（可用镜像：`npm config set registry …`、`PIP_INDEX_URL`）。不需要 Docker |
 | CDK 引导 | 每个账号 / 区域一次：`cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>` |
 
 ### 1. 配置
@@ -482,7 +493,8 @@ cp config.example.json config.json
 | `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀（默认 `quicksight-chat-assistant/datasource/`） |
 | `dataAccess.extraSecretArns` | 如果要复用 QuickSight 数据源自己使用的密钥，在这里列出 |
 | `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]` |
-| `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长） |
+| `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长，以及任务的工具令牌的有效期） |
+| `sessionSeconds` | 可选：浏览器一次登录的有效期，300-43200 秒（默认 3600 = 1 小时） |
 | `api.rateLimit` / `burstLimit` | HTTP API 限流 |
 | `frameAncestors` | 允许嵌入聊天页的来源（你所在区域的 QuickSight 控制台域名） |
 | `examples` | 可选：替换内置通用示例的部署级示例问题：`[{"group": "…", "tip": "…", "questions": ["…"]}]`，JSON 不超过 2500 字节。可用于针对客户数据做演示。带 `"edit": true`（或名称以“修改”开头）的分组在仪表盘里不显示 |
@@ -632,8 +644,8 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 ### 自定义示例问题
 
 在分析有自己的一套示例之前，输入框下方的 **示例问题** 栏显示部署级默认：一个适用于任何分析的问题，或管理员在 `config.json`
-的 `examples` 里配置的分组。分析的编辑者在聊天里维护这一套；分析的查看者、以及由它发布的仪表盘的查看者都能看到（名称含“修改”
-的分组在仪表盘里不显示）。
+的 `examples` 里配置的分组。分析的编辑者在分析的聊天里维护这一套；分析的查看者、以及由它发布的仪表盘的查看者都能看到（名称含“修改”
+的分组在仪表盘里不显示）。仪表盘只用于使用已发布的内容：仪表盘里的聊天没有 **管理** 和 **☆ 加入示例**。
 
 - 自己问过的问题下方有 **☆ 加入示例**，点一下加入“常用问题”分组（第一次加入时，保留当时显示的默认示例）。
 - **示例问题** 旁的 **管理** 打开编辑器：每个分组有名称、可选说明、每行一个问题；可以添加或删除分组、**保存**，或点
@@ -645,7 +657,8 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 
 ### 提问与修改
 
-1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码）。会话有效期 8 小时。
+1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码）。一次登录有效 1 小时（`sessionSeconds`）；过期后重新登录，
+   对话会接着进行，包括还在进行中的回答。点 **退出** 立即注销。
    示例问题在输入框下方折叠的 **示例问题** 栏里，每组一个标签；点一个即提问。
 2. 提问示例：
    - *这个分析有哪些图表，各自展示什么？*
@@ -665,14 +678,16 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 
 | 方面 | 机制 |
 |---|---|
-| 登录 | 只有分配到 Identity Center 应用的用户；SAML 断言校验签名、受众、ACS、有效期和重放 |
-| 会话 | HMAC 签名的令牌，8 小时，保存在 iframe 的浏览器存储中 |
-| 谁能看数据 | 用户必须能查看该分析或由它发布的仪表盘；只能查询该分析的数据集 |
+| 登录 | 只有分配到 Identity Center 应用的用户；SAML 断言校验签名（逐一对照应用元数据里的每张签名证书，证书轮换期间也能登录）、颁发者、受众、ACS、请求 ID、有效期和重放；没有 ID 的断言拒绝 |
+| 会话 | 用 HS256 签名的 JWT（PyJWT），默认 1 小时（`sessionSeconds`），保存在 iframe 的浏览器存储中；只有 web Lambda 接受；点 **退出** 会在服务端立即吊销 |
+| 聊天页 | Content-Security-Policy：脚本只能来自页面自己的来源（没有内联脚本），请求只能发往它的 API，不允许插件和表单提交，只能被 `frameAncestors` 嵌入；样式允许内联（ECharts 提示框需要）。模型回答经 DOMPurify 净化，不允许图片、iframe 和样式 |
+| 谁能看数据 | 用户必须能查看该分析或由它发布的仪表盘；只能查询该分析的数据集。登录邮箱必须恰好对应一个活跃的 QuickSight 用户（有多个时拒绝，而不是合并） |
 | 数据集规则 | 启用了行级权限、数据集筛选或联接的数据集拒绝查询（直接查源会绕过这些规则）；列级权限限制的列对未授权用户隐藏 |
 | 查询 | 模型从不写 SQL：结构化请求，列名按数据集校验，固定的聚合与运算符，绑定参数，只读事务，20 秒超时，最多 500 行 |
 | 沙箱 | Code Interpreter 为 SANDBOX 网络模式，没有执行角色：只拿到用户本来就能查询的结果行 |
 | 谁能修改 | 用户对该分析有 `quicksight:UpdateAnalysis`（QuickSight 共享）；只有发起人能在 10 分钟内应用一次；每次修改前都把原定义备份到 S3 |
-| 工具拿到的身份 | Runtime 在代码里把已验证的令牌附加到本方案自己的工具调用上；模型看不到也伪造不了；企业 MCP 服务器拿不到 |
+| 工具拿到的身份 | 工具永远拿不到浏览器的令牌。web Lambda 为每个任务签发一个工具令牌（绑定用户和分析，有效期为 Runtime 会话的最长时长），为每次按钮点击签发 5 分钟的工具令牌；Runtime 在代码里把它附加到本方案自己的工具调用上；模型看不到也伪造不了；企业 MCP 服务器拿不到。工具 Lambda 拒绝会话令牌，也拒绝为其他分析签发的令牌 |
+| 权限变更 | QuickSight 用户、组和共享设置最多缓存 60 秒，所以撤销共享或移出组在一分钟内生效；“由分析发布的仪表盘”列表缓存 5 分钟（仪表盘改为从另一个分析发布后，它的查看者对旧分析的访问最多保留这么久） |
 | 数据流向 | 提问和结果发送到你的模型端点；CloudWatch 日志里不含令牌或密码，也不记录登录邮箱（改用不可逆的按用户标识）、SAML 属性或模型输出文本（仅记录长度/计数用于诊断）|
 
 SPICE 数据集：内置查询读取的是源数据的当前值，可能比上次 SPICE 刷新更新（回答里会说明）。
@@ -696,6 +711,8 @@ Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
 | 回答慢 | Runtime 日志的 `answered` 事件里有每次调用的 `setup_ms`、`tool_ms`、`model_ms`；反复失败的工具调用或慢的模型调用会在这里体现 |
 | 聊天窗口显示邮箱而不是姓名 | 看 web Lambda 日志的 `name_lookup_failed`：用户不在用户目录里，或 Identity Center 在其他账号 / 区域（配置 `identityCenter.identityStoreId` / `region`） |
 | 没有分析的权限 | 用户在 QuickSight 里看不到它，或邮箱不一致 |
+| “QuickSight 里有 N 个活跃用户使用同一个邮箱” | 多个活跃的 QuickSight 用户用了同一个邮箱（例如同一个人通过两个 IAM 角色联合登录过）；停用或删除多余的用户 |
+| 一小时后要求重新登录 | 正常：一次登录的有效期是 `sessionSeconds`（默认 1 小时）；重新登录后对话会接着进行 |
 | 缺少数据库凭证 | 创建数据源密钥（第 5 步） |
 | 内置查询不支持某个数据集 | 行级权限、数据集筛选、联接，或不支持的数据源；接入企业 MCP 服务器 |
 | 查询超时 / 连接错误 | 数据库安全组或路由没有放行数据工具 Lambda |
@@ -724,5 +741,8 @@ ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-nort
 ./qsca build
 ```
 
+单元测试需要 `boto3` 和 `PyJWT`；`tests/unit/test_auth.py` 里的 SAML 测试还需要下面固定版本的 `signxml`、`lxml` 和
+`cryptography`（没有时跳过）。
+
 固定版本：strands-agents 1.61.1、bedrock-agentcore 1.24.2、boto3 1.43.115、signxml 5.2.0、lxml 6.1.3、cryptography 50.0.2、
-pg8000 1.31.5、PyMySQL 1.1.2、aws-cdk-lib 2.274.0、ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17。
+PyJWT 2.15.1、pg8000 1.31.5（配 scramp 1.4.18）、PyMySQL 1.1.2、aws-cdk-lib 2.274.0、ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17。

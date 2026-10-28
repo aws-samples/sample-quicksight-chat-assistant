@@ -53,6 +53,15 @@ class PublisherTest(unittest.TestCase):
         api = {"detail": {"requestParameters": {"dashboardId": "d2"}}}
         self.assertEqual(publisher.ids_from(api), ("d2", ""))
 
+    def test_ids_from_first_console_publish(self):
+        # CreateDashboard from the console names the new dashboard only in eventResponseDetails (CloudTrail, cn-north-1)
+        first = {"detail": {"eventName": "CreateDashboard", "eventType": "AwsServiceEvent", "requestParameters": None,
+                            "serviceEventDetails": {
+                                "eventRequestDetails": {"dashboardName": "d", "analysisId": "arn:aws-cn:quicksight:cn-north-1:1:analysis/a3"},
+                                "eventResponseDetails": {"dashboardId": "arn:aws-cn:quicksight:cn-north-1:1:dashboard/d3"}}}}
+        self.assertEqual(publisher.ids_from(first), ("d3", "a3"))
+        self.assertEqual(publisher.ids_from({"detail": {"eventName": "CreateDashboard"}}), ("", ""))
+
 
 
 class BindTest(unittest.TestCase):

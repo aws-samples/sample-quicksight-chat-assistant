@@ -1,20 +1,21 @@
 """Who is calling, and what may they do in QuickSight. Shared by the analysis and data tool Lambdas.
 
-Every tool call carries `_caller` (the user's signed chat session token) and `_analysis` (the analysis the chat panel
-is embedded in). The agent Runtime adds both in code; the model can neither see nor set them. This module verifies
-the token with the web Lambda's HMAC key, maps the email to QuickSight users, and answers permission questions
-using QuickSight's own sharing settings, so the assistant never lets anyone do more than QuickSight would.
+Every tool call carries `_caller` (a tool token the web Lambda issued for this user and analysis, see tokens.py) and
+`_analysis` (the analysis the chat panel is embedded in). The agent Runtime adds both in code; the model can neither
+see nor set them. This module verifies the token (audience "qsca:tools", bound to `_analysis`), maps the email to
+the one QuickSight user with that email, and answers permission questions using QuickSight's own sharing settings,
+so the assistant never lets anyone do more than QuickSight would.
 """
 
-import base64
 import hashlib
-import hmac
 import json
 import os
 import re
 import time
 
 import boto3
+
+import tokens
 
 ACCOUNT = os.environ["ACCOUNT_ID"]
 QS_REGION = os.environ.get("QS_REGION") or os.environ.get("AWS_REGION")
@@ -44,22 +45,22 @@ def cached(key, loader, seconds=CACHE_SECONDS):
 def _session_key():
     def load():
         raw = boto3.client("secretsmanager").get_secret_value(SecretId=SESSION_SECRET_ID)["SecretString"]
-        return hashlib.sha256(raw.encode("utf-8")).digest()  # same derivation as web/auth.py
+        return tokens.signing_key(raw)  # same key as web/auth.py
     return cached("session-key", load, 3600)
 
 
-def verify_token(token):
-    """Same check as web/auth.py verify_session: HMAC-SHA256 over the body, then expiry. Returns the email."""
-    if not isinstance(token, str) or token.count(".") != 1 or len(token) > 2048:
+def verify_token(token, analysis):
+    """Check a tool token (tokens.verify: HS256 signature, issuer, audience "qsca:tools", expiry) and that it was
+    issued for `analysis` ("" for the analysis picker). A browser session token is refused. Returns the email."""
+    if not token:
         raise ToolError("缺少已登录用户的身份")
-    body, signature = token.split(".")
-    expected = base64.urlsafe_b64encode(hmac.new(_session_key(), body.encode("ascii"), hashlib.sha256).digest())
-    if not hmac.compare_digest(signature, expected.rstrip(b"=").decode("ascii")):
-        raise ToolError("用户身份校验失败")
-    payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    if int(payload.get("exp", 0)) <= time.time():
-        raise ToolError("登录已过期，请重新登录后再试")
-    return payload["sub"]
+    try:
+        claims = tokens.verify(_session_key(), token, tokens.TOOLS_AUDIENCE, required=("analysis",))
+    except tokens.InvalidToken as error:
+        raise ToolError("登录已过期，请重新登录后再试" if error.expired else "用户身份校验失败") from error
+    if claims["analysis"] != analysis:
+        raise ToolError("用户身份不是为这个分析签发的")
+    return claims["sub"]
 
 
 def analysis_id(args):
@@ -82,10 +83,17 @@ def _paged(call, key, **kwargs):
 
 
 def principals(email):
-    """ARNs of the active QuickSight users with this email and of their groups."""
+    """ARNs of the one active QuickSight user with this email and of its groups.
+
+    The email is the only link between the Identity Center sign-in and QuickSight, and QuickSight does not keep it
+    unique, so several active users with the same email are refused rather than merged (their permissions would be
+    combined, possibly someone else's)."""
     def load():
         users = [u for u in _paged(qs.list_users, "UserList", Namespace=NAMESPACE)
                  if (u.get("Email") or "").lower() == email.lower() and u.get("Active", True)]
+        if len(users) > 1:
+            raise ToolError(f"QuickSight 里有 {len(users)} 个活跃用户使用同一个邮箱，无法确定是哪一个；"
+                            "请管理员停用或删除重复的用户后再试")
         arns = set()
         for user in users:
             arns.add(user["Arn"])
@@ -137,13 +145,17 @@ def dashboards_of(aid):
 
 def require_viewer(args):
     """The caller may view the analysis, or a dashboard published from it. Returns (email, analysis_id)."""
-    email, aid = verify_token(args.get("_caller")), analysis_id(args)
+    aid = analysis_id(args)
+    email = verify_token(args.get("_caller"), aid)
     arns = principals(email)
     if _has(analysis_permissions(aid), arns):
         return email, aid
     for dashboard_id in dashboards_of(aid):
-        perms = cached(f"dperm:{dashboard_id}", lambda d=dashboard_id: qs.describe_dashboard_permissions(
-            AwsAccountId=ACCOUNT, DashboardId=d).get("Permissions", []))
+        try:
+            perms = cached(f"dperm:{dashboard_id}", lambda d=dashboard_id: qs.describe_dashboard_permissions(
+                AwsAccountId=ACCOUNT, DashboardId=d).get("Permissions", []))
+        except qs.exceptions.ResourceNotFoundException:
+            continue  # deleted since dashboards_of() was cached
         if _has(perms, arns):
             return email, aid
     raise ToolError(f"{email} 没有查看这个分析或其仪表盘的权限")
@@ -151,7 +163,8 @@ def require_viewer(args):
 
 def require_editor(args):
     """The caller holds quicksight:UpdateAnalysis on the analysis (directly or through a group)."""
-    email, aid = verify_token(args.get("_caller")), analysis_id(args)
+    aid = analysis_id(args)
+    email = verify_token(args.get("_caller"), aid)
     if not _has(analysis_permissions(aid), principals(email), "quicksight:UpdateAnalysis"):
         raise ToolError(f"{email} 没有编辑这个分析的权限，未做任何修改")
     return email, aid
