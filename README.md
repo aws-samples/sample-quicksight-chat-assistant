@@ -387,7 +387,7 @@ ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-nort
 The unit tests need `boto3` and `PyJWT`; the SAML tests in `tests/unit/test_auth.py` also need `signxml`, `lxml` and
 `cryptography` at the pinned versions below (skipped otherwise).
 
-Pinned: strands-agents 1.61.1, bedrock-agentcore 1.24.2, boto3 1.43.115, signxml 5.2.0, lxml 6.1.3,
+Pinned: strands-agents 1.61.1, bedrock-agentcore 1.24.2, mcp 1.30.0, boto3 1.43.115, signxml 5.2.0, lxml 6.1.3,
 cryptography 50.0.2, PyJWT 2.15.1, pg8000 1.31.5 (with scramp 1.4.18), PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17.
 
 ---
@@ -744,5 +744,5 @@ ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-nort
 单元测试需要 `boto3` 和 `PyJWT`；`tests/unit/test_auth.py` 里的 SAML 测试还需要下面固定版本的 `signxml`、`lxml` 和
 `cryptography`（没有时跳过）。
 
-固定版本：strands-agents 1.61.1、bedrock-agentcore 1.24.2、boto3 1.43.115、signxml 5.2.0、lxml 6.1.3、cryptography 50.0.2、
+固定版本：strands-agents 1.61.1、bedrock-agentcore 1.24.2、mcp 1.30.0、boto3 1.43.115、signxml 5.2.0、lxml 6.1.3、cryptography 50.0.2、
 PyJWT 2.15.1、pg8000 1.31.5（配 scramp 1.4.18）、PyMySQL 1.1.2、aws-cdk-lib 2.274.0、ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17。
