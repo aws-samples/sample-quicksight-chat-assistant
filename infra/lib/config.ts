@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as path from 'path';
 
 /** One enterprise MCP server registered on the gateway (e.g. DataHub or Metabase behind MCPHub). */
 export interface McpTargetConfig {
@@ -31,7 +32,9 @@ export interface AppConfig {
     /** Where the data tool Lambda runs so it can reach the databases behind QuickSight datasets; null = no VPC. */
     vpc: null | { vpcId: string; subnetIds: string[]; securityGroupIds: string[]; createInterfaceEndpoints: boolean };
     datasourceSecretPrefix: string;
-    extraSecretArns: string[];
+    /** Ignored: the data tools read only `<datasourceSecretPrefix><DataSourceId>` (no other secrets). Kept so older
+     * config files still load. */
+    extraSecretArns?: string[];
   };
   mcpTargets: McpTargetConfig[];
   runtime: { idleSeconds: number; maxLifetimeSeconds: number };
@@ -43,8 +46,13 @@ export interface AppConfig {
   examples?: { group: string; tip?: string; questions: string[] }[];
 }
 
-export function loadConfig(path: string): AppConfig {
-  const config = JSON.parse(fs.readFileSync(path, 'utf-8')) as AppConfig;
+/** The operator's deployment config (`-c config=...` or config.json). It is the operator's own choice of file, so
+ * it may live anywhere; it must be a regular .json file. The nosemgrep markers cover the operator-chosen path. */
+export function loadConfig(file: string): AppConfig {
+  const resolved = path.resolve(file); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const stat = fs.statSync(resolved); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
+  if (path.extname(resolved) !== '.json' || !stat.isFile()) throw new Error(`config ${file}: must be a regular .json file`);
+  const config = JSON.parse(fs.readFileSync(resolved, 'utf-8')) as AppConfig; // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
   const problems: string[] = [];
   if (!/^[a-z][a-z0-9]{1,11}$/.test(config.prefix)) problems.push('prefix: 2-12 lowercase letters/digits, starting with a letter');
   if (!config.region) problems.push('region is required');
@@ -63,6 +71,6 @@ export function loadConfig(path: string): AppConfig {
   }
   const examples = Buffer.byteLength(JSON.stringify(config.examples ?? []), 'utf8');
   if (examples > 2500) problems.push(`examples: ${examples} bytes as JSON; keep under 2500 (Lambda environment variables share a 4 KB limit)`);
-  if (problems.length) throw new Error(`config ${path}:\n  - ${problems.join('\n  - ')}`);
+  if (problems.length) throw new Error(`config ${file}:\n  - ${problems.join('\n  - ')}`);
   return config;
 }

@@ -6,9 +6,11 @@ Tools (the Runtime adds `_caller` and `_analysis` to every call):
 - distinct_values(dataset_id, column, search?)   up to 50 values, e.g. to check a control value exists
 
 Access rules: the caller must be allowed to view the analysis (or a dashboard published from it), the dataset must
-be one the analysis uses, and the dataset must pass dataset.plan() (no RLS, no dataset filters, no joins).
-Database credentials come from Secrets Manager: `<DATASOURCE_SECRET_PREFIX><DataSourceId>` holding
-{"username", "password"}, or the secret the QuickSight data source itself uses.
+be one the analysis uses, the dataset must pass dataset.plan() (one relational table; no custom SQL, RLS, dataset
+filters or joins), and only columns the analysis definition references can be described, queried or listed.
+Database credentials come only from the assistant's own Secrets Manager secret
+`<DATASOURCE_SECRET_PREFIX><DataSourceId>` holding {"username", "password"} of a dedicated SELECT-only database user
+(`./qsca datasource-secret`); the QuickSight data source's own secret is never used.
 """
 
 import datetime as dt
@@ -22,11 +24,11 @@ import boto3
 
 import caller
 import dataset as ds
+import definition as defs
 import sqlcompile
 from caller import ToolError, log
 
 SECRET_PREFIX = os.environ.get("DATASOURCE_SECRET_PREFIX", "quicksight-chat-assistant/datasource/")
-STATEMENT_TIMEOUT_MS = int(os.environ.get("STATEMENT_TIMEOUT_MS", "20000"))
 CA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rds-ca.pem")
 qs = caller.qs
 _connections = {}
@@ -43,26 +45,24 @@ def _dataset(args):
         raise ToolError(f"数据集 {dataset_id} 不属于当前分析；可用的数据集：{', '.join(sorted(used))}")
     description = caller.cached(f"ds:{dataset_id}", lambda: qs.describe_data_set(
         AwsAccountId=caller.ACCOUNT, DataSetId=dataset_id)["DataSet"])
+    referenced = defs.referenced_columns(definition).get(dataset_id, set())
     try:
-        return description, ds.plan(description, caller.principals(email))
+        return description, ds.plan(description, caller.principals(email), referenced=referenced)
     except ds.Unsupported as error:
         raise ToolError(f"内置查询不支持这个数据集：{error}。如已接入其他数据工具（如 MCP），请改用它们。") from error
 
 
 def _secret(data_source):
-    names = [SECRET_PREFIX + data_source["DataSourceId"]]
-    if data_source.get("SecretArn"):
-        names.append(data_source["SecretArn"])
-    for name in names:
-        region = name.split(":")[3] if name.startswith("arn:") else None
-        try:
-            raw = boto3.client("secretsmanager", region_name=region).get_secret_value(SecretId=name)["SecretString"]
-            secret = json.loads(raw)
-            return secret["username"], secret["password"]
-        except Exception as error:  # noqa: BLE001 - try the next source, report below
-            last = error
-    raise ToolError(f"找不到数据源 {data_source['DataSourceId']} 的数据库凭证。请管理员在 Secrets Manager 创建 "
-                    f"{names[0]}（内容 {{\"username\":..., \"password\":...}}）。({type(last).__name__})")
+    """The assistant's own credentials for this data source (a dedicated SELECT-only database user). There is no
+    fallback to the QuickSight data source's secret, whose user may be able to write."""
+    name = SECRET_PREFIX + data_source["DataSourceId"]
+    try:
+        secret = json.loads(boto3.client("secretsmanager").get_secret_value(SecretId=name)["SecretString"])
+        return secret["username"], secret["password"]
+    except Exception as error:  # noqa: BLE001 - reported to the admin below
+        raise ToolError(f"找不到数据源 {data_source['DataSourceId']} 的数据库凭证。请管理员用只有 SELECT 权限的数据库用户运行 "
+                        f"./qsca datasource-secret {data_source['DataSourceId']}（Secrets Manager 里的 {name}）。"
+                        f"({type(error).__name__})") from error
 
 
 def _connect(data_source_arn):
@@ -95,7 +95,7 @@ def _connect(data_source_arn):
                                         database=info["database"], ssl_context=context, timeout=30,
                                         application_name="quicksight-chat-assistant")
         conn.run("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        conn.run(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+        conn.run("SET statement_timeout = 20000")  # milliseconds
 
         def run(sql, params):
             rows = conn.run(sql, **params)
@@ -107,7 +107,7 @@ def _connect(data_source_arn):
                                database=info["database"], ssl=context, connect_timeout=15, read_timeout=60,
                                autocommit=False, charset="utf8mb4")
         with conn.cursor() as cursor:
-            cursor.execute(f"SET SESSION max_execution_time = {STATEMENT_TIMEOUT_MS}")
+            cursor.execute("SET SESSION max_execution_time = 20000")  # milliseconds
             cursor.execute("SET SESSION TRANSACTION READ ONLY")
 
         def run(sql, params):

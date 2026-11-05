@@ -2,6 +2,7 @@
 config.json
 build/
 infra/node_modules/
+tests/js/node_modules/
 infra/cdk.out/
 infra/cdk.context.json
 __pycache__/

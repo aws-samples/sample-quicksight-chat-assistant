@@ -33,80 +33,40 @@ const pendingKey = () => (auth ? `${PREFIX}pending:${auth.user.sub}:${ANALYSIS}`
 const SESSION_KEY = PREFIX + "session:" + ANALYSIS;
 let sessionId = sessionStorage.getItem(SESSION_KEY) || "";
 const history = [];
-const $ = (id) => document.getElementById(id);
+const byId = (id) => document.getElementById(id);
+// Safe rendering (web/render.js): el() builds nodes with text children, markdown() is the one sanitizer boundary.
+const { el, fragment, markdown } = window.QscaRender;
 
 for (const [name, value] of Object.entries(parameters)) {
   if (!value) continue;
   const chip = document.createElement("span");
   chip.className = "chip";
   chip.textContent = `${name}：${value}`;
-  $("ctx").append(chip);
+  byId("ctx").append(chip);
 }
 
-function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-// Model answers are Markdown: parse with marked (GFM: headings, lists, tables), then sanitize with an allow-list.
-// No <img>/<iframe>/style: model output must not make the page fetch remote URLs (data exfiltration via prompt injection).
-const MD_TAGS = ["p", "br", "strong", "em", "b", "i", "del", "s", "code", "pre", "blockquote", "ul", "ol", "li",
-  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "a", "span", "div"];
-const MD_ATTRS = ["href", "title", "align", "start", "class"];
-// CommonMark does not close "**" after punctuation when a letter follows, so "**结论：**省内…" (common in Chinese)
-// stays literal. Bold any "**…**" span on one line whose ends are not spaces; code spans are tokenized first.
-if (window.marked) {
-  marked.use({ extensions: [{
-    name: "cjkStrong", level: "inline",
-    start(src) { const i = src.indexOf("**"); return i < 0 ? undefined : i; },
-    tokenizer(src) {
-      const match = /^\*\*(?![\s*])([^\n]*?[^\s*])\*\*(?!\*)/.exec(src);
-      if (match) return { type: "strong", raw: match[0], text: match[1], tokens: this.lexer.inlineTokens(match[1]) };
-    },
-  }] });
-}
-if (window.DOMPurify) {
-  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-    if (node.tagName === "A") {
-      if (!/^https?:\/\//i.test(node.getAttribute("href") || "")) node.removeAttribute("href");
-      node.setAttribute("target", "_blank");
-      node.setAttribute("rel", "noopener noreferrer");
-    }
-  });
-}
-function render(md) {
-  if (!window.marked || !window.DOMPurify) return renderPlain(md);
-  try {
-    const html = marked.parse(String(md), { gfm: true, breaks: true, async: false })
-      .replace(/<table>/g, '<div class="md-table"><table>').replace(/<\/table>/g, "</table></div>");
-    return DOMPurify.sanitize(html, { ALLOWED_TAGS: MD_TAGS, ALLOWED_ATTR: MD_ATTRS, ALLOW_DATA_ATTR: false });
-  } catch (e) {
-    return renderPlain(md);
-  }
-}
-// Fallback when the Markdown libraries failed to load: bold, inline code, bullet lists, paragraphs.
-function renderPlain(md) {
-  const blocks = escapeHtml(md).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>").split(/\n{2,}/);
-  return blocks.map((b) => {
-    const lines = b.split("\n");
-    if (lines.every((l) => /^\s*([-*]|\d+\.)\s+/.test(l))) return "<ul>" + lines.map((l) => "<li>" + l.replace(/^\s*([-*]|\d+\.)\s+/, "") + "</li>").join("") + "</ul>";
-    return "<p>" + lines.join("<br>") + "</p>";
-  }).join("");
-}
-function add(role, html, extra = "") {
-  const div = document.createElement("div");
-  div.className = `msg ${role} ${extra}`.trim();
-  div.innerHTML = html;
-  $("log").append(div);
-  $("log").scrollTop = $("log").scrollHeight;
+// A chat message from nodes and text (never an HTML string): content is a node, a fragment, text or a list of them.
+function addMessage(role, content, extra = "") {
+  const div = el("div", { class: `msg ${role} ${extra}`.trim() }, content);
+  byId("log").append(div);
+  byId("log").scrollTop = byId("log").scrollHeight;
   return div;
 }
 
-// ---- Sign-in: IAM Identity Center (SAML) in a popup; the session token lives in this iframe's storage for 1 hour
-// (the deployment's sessionSeconds). When it expires the conversation stays: sign in again and it continues. ----
+// ---- Sign-in: IAM Identity Center (SAML) in a popup; the session token lives in this tab's sessionStorage for 1 hour
+// (the deployment's sessionSeconds), so it is gone when the tab closes and each tab signs in on its own. When it
+// expires the conversation stays (localStorage): sign in again and it continues. ----
 let auth = null;
 let mismatchNotice = "";
+try { localStorage.removeItem(AUTH_KEY); } catch {}  // older versions kept the token in localStorage
 try {
-  const saved = JSON.parse(localStorage.getItem(AUTH_KEY) || "null");
+  const saved = JSON.parse(sessionStorage.getItem(AUTH_KEY) || "null");
   if (saved && saved.token && saved.user && saved.user.exp * 1000 > Date.now() + 60000) auth = saved;
 } catch {}
-function clearStored() { for (const key of Object.keys(localStorage)) if (key.startsWith(PREFIX)) localStorage.removeItem(key); }
+function clearStored() {
+  try { sessionStorage.removeItem(AUTH_KEY); } catch {}
+  for (const key of Object.keys(localStorage)) if (key.startsWith(PREFIX)) localStorage.removeItem(key);
+}
 // Sign-out revokes the token on the server too, so a copy of it (e.g. taken from this storage) stops working.
 function revoke(token) {
   if (!token) return;
@@ -122,33 +82,33 @@ function sessionExpired() { return !auth || auth.user.exp * 1000 <= Date.now() +
 // Expiry (or a 401): forget only the token; this user's conversation and a running answer are picked up after sign-in.
 function expire(message) {
   auth = null;
-  try { localStorage.removeItem(AUTH_KEY); } catch {}
+  try { sessionStorage.removeItem(AUTH_KEY); } catch {}
   renderWho();
   showLogin(message || "登录已过期，请重新登录，对话会接着进行。");
 }
 function setInputEnabled(enabled) {
-  $("q").disabled = !enabled;
-  $("send").disabled = !enabled;
-  $("q").placeholder = enabled ? "输入问题，Enter 发送，Shift+Enter 换行" : "请先登录";
-  $("quick").hidden = !enabled;  // example questions only make sense once signed in
+  byId("q").disabled = !enabled;
+  byId("send").disabled = !enabled;
+  byId("q").placeholder = enabled ? "输入问题，Enter 发送，Shift+Enter 换行" : "请先登录";
+  byId("quick").hidden = !enabled;  // example questions only make sense once signed in
   if (!enabled) setQuickOpen(false);
 }
 function renderWho() {
-  $("who").innerHTML = "";
+  byId("who").replaceChildren();
   if (!auth) return;
   const name = document.createElement("span");
   name.textContent = auth.user.name || auth.user.sub;
   name.title = auth.user.sub;
   const out = document.createElement("button");
   out.type = "button"; out.textContent = "退出"; out.onclick = () => signOut("已退出。");
-  $("who").append(name, out);
+  byId("who").append(name, out);
 }
 function signOut(message) {
   if (auth) revoke(auth.token);
   auth = null;
   clearStored();
   history.length = 0;
-  for (const node of [...$("log").querySelectorAll(".msg:not(.login)")]) node.remove();
+  for (const node of [...byId("log").querySelectorAll(".msg:not(.login)")]) node.remove();
   renderWho();
   showLogin(message);
 }
@@ -160,7 +120,7 @@ const DEFAULT_EXAMPLES = [
   { group: "快速开始", tip: MANAGE_HINT, questions: ["这个分析有哪些图表，各自展示什么？"] },
 ];
 const ALL_EXAMPLES = (() => {
-  try { const v = JSON.parse($("examples-data").textContent); return Array.isArray(v) && v.length ? v : DEFAULT_EXAMPLES; }
+  try { const v = JSON.parse(byId("examples-data").textContent); return Array.isArray(v) && v.length ? v : DEFAULT_EXAMPLES; }
   catch { return DEFAULT_EXAMPLES; }
 })();
 // Edit examples ("edit": true, or a group named 修改分析) make no sense in a published dashboard.
@@ -174,7 +134,7 @@ async function loadExamples() {
     const result = await api(`/examples?analysis=${encodeURIComponent(ANALYSIS)}`);
     applyExamples(result.groups);
     examples.canEdit = !!result.can_edit && !IN_DASHBOARD;
-    $("quickManage").hidden = !examples.canEdit;
+    byId("quickManage").hidden = !examples.canEdit;
     document.body.classList.toggle("can-edit-examples", examples.canEdit);
   } catch {}  // keep the default examples
 }
@@ -182,7 +142,7 @@ function applyExamples(groups) {
   examples.custom = Array.isArray(groups) && groups.length > 0;
   EXAMPLES = forPage(examples.custom ? groups : ALL_EXAMPLES);
   quickGroup = Math.min(quickGroup, Math.max(EXAMPLES.length - 1, 0));
-  if (!$("quickPanel").hidden && $("quickEditor").hidden) renderQuick();  // never redraw over an open editor
+  if (!byId("quickPanel").hidden && byId("quickEditor").hidden) renderQuick();  // never redraw over an open editor
 }
 async function addExample(question, button) {
   button.disabled = true;
@@ -198,7 +158,7 @@ async function addExample(question, button) {
   }
 }
 function addUser(text) {
-  const div = add("user", render(text));
+  const div = addMessage("user", markdown(text));
   const star = document.createElement("button");
   star.type = "button"; star.className = "add-example"; star.textContent = "☆ 加入示例";
   star.title = "把这个问题加入这个分析的示例问题";
@@ -208,23 +168,26 @@ function addUser(text) {
 }
 // 管理: one box per group (name, optional tip, one question per line); answers the assistant generated can be pasted.
 function renderEditor() {
-  const editor = $("quickEditor");
+  const editor = byId("quickEditor");
   const groups = (examples.custom ? EXAMPLES : ALL_EXAMPLES).map((g) => ({ ...g }));
-  editor.innerHTML = `<p class="note">每行一个问题；删光所有分组再保存，等于恢复默认。可以先让助手“给这个分析出一些示例问题”，再把喜欢的粘贴进来。分析和由它发布的仪表盘共用这一套；仪表盘里不显示名称含“修改”的分组。</p>
-    <div class="ex-groups"></div>
-    <button type="button" class="ex-add">添加分组</button><br>
-    <button type="button" class="primary ex-save">保存</button><button type="button" class="ex-cancel">取消</button><button type="button" class="ex-reset">恢复默认</button>
-    <p class="note ex-msg"></p>`;
+  editor.replaceChildren(
+    el("p", { class: "note" }, "每行一个问题；删光所有分组再保存，等于恢复默认。可以先让助手“给这个分析出一些示例问题”，再把喜欢的粘贴进来。分析和由它发布的仪表盘共用这一套；仪表盘里不显示名称含“修改”的分组。"),
+    el("div", { class: "ex-groups" }), " ",
+    el("button", { type: "button", class: "ex-add" }, "添加分组"), el("br"),
+    el("button", { type: "button", class: "primary ex-save" }, "保存"), el("button", { type: "button", class: "ex-cancel" }, "取消"),
+    el("button", { type: "button", class: "ex-reset" }, "恢复默认"),
+    el("p", { class: "note ex-msg" }));
   const list = editor.querySelector(".ex-groups");
   const addGroup = (g) => {
-    const box = document.createElement("div");
-    box.className = "ex-group";
-    box.innerHTML = `<div class="row"><input class="ex-name" maxlength="30" placeholder="分组名，例如：常用问题"><button type="button" class="ex-del">删除分组</button></div>
-      <input class="ex-tip" maxlength="80" placeholder="说明（可选）"><textarea class="ex-questions" placeholder="每行一个问题"></textarea>`;
-    box.querySelector(".ex-name").value = g.group || "";
-    box.querySelector(".ex-tip").value = g.tip || "";
-    box.querySelector(".ex-questions").value = (g.questions || []).join("\n");
-    box.querySelector(".ex-del").onclick = () => box.remove();
+    const name = el("input", { class: "ex-name", maxlength: 30, placeholder: "分组名，例如：常用问题" });
+    const tip = el("input", { class: "ex-tip", maxlength: 80, placeholder: "说明（可选）" });
+    const questions = el("textarea", { class: "ex-questions", placeholder: "每行一个问题" });
+    const remove = el("button", { type: "button", class: "ex-del" }, "删除分组");
+    const box = el("div", { class: "ex-group" }, el("div", { class: "row" }, name, remove), " ", tip, questions);
+    name.value = g.group || "";
+    tip.value = g.tip || "";
+    questions.value = (g.questions || []).join("\n");
+    remove.onclick = () => box.remove();
     list.append(box);
   };
   groups.forEach(addGroup);
@@ -254,22 +217,22 @@ function renderEditor() {
 // Collapsed "示例问题" bar under the input box: one tab per group; clicking a question asks it and folds the panel.
 let quickGroup = 0;
 function setQuickOpen(open) {
-  $("quickToggle").setAttribute("aria-expanded", String(open));
-  $("quickPanel").hidden = !open;
+  byId("quickToggle").setAttribute("aria-expanded", String(open));
+  byId("quickPanel").hidden = !open;
   showEditor(false);
   if (open) renderQuick();
 }
 function showEditor(on) {  // the panel shows either the example questions or the 管理 editor, never both
-  $("quickEditor").hidden = !on;
-  $("quickTabs").hidden = on;
-  $("quickList").hidden = on;
-  if (on) $("quickTip").hidden = true;
-  $("quickPanel").classList.toggle("editing", on);
-  $("quickManage").textContent = on ? "完成管理" : "管理";
+  byId("quickEditor").hidden = !on;
+  byId("quickTabs").hidden = on;
+  byId("quickList").hidden = on;
+  if (on) byId("quickTip").hidden = true;
+  byId("quickPanel").classList.toggle("editing", on);
+  byId("quickManage").textContent = on ? "完成管理" : "管理";
 }
 function renderQuick() {
-  const tabs = $("quickTabs"), list = $("quickList");
-  tabs.innerHTML = ""; list.innerHTML = "";
+  const tabs = byId("quickTabs"), list = byId("quickList");
+  tabs.replaceChildren(); list.replaceChildren();
   EXAMPLES.forEach((g, i) => {
     const tab = document.createElement("button");
     tab.type = "button"; tab.role = "tab"; tab.textContent = g.group;
@@ -281,33 +244,35 @@ function renderQuick() {
   // A dashboard is for using what was published: it has no 管理, so drop the hint about it - also when an analysis'
   // saved set kept the default group with its hint.
   const tip = IN_DASHBOARD && group.tip === MANAGE_HINT ? "" : group.tip || "";
-  $("quickTip").textContent = tip;
-  $("quickTip").hidden = !tip;
+  byId("quickTip").textContent = tip;
+  byId("quickTip").hidden = !tip;
   for (const q of group.questions || []) {
     const b = document.createElement("button");
-    b.type = "button"; b.textContent = q; b.disabled = $("send").disabled;
-    b.onclick = () => { if ($("send").disabled) return; setQuickOpen(false); ask(q); };
+    b.type = "button"; b.textContent = q; b.disabled = byId("send").disabled;
+    b.onclick = () => { if (byId("send").disabled) return; setQuickOpen(false); ask(q); };
     list.append(b);
   }
 }
-$("quickToggle").addEventListener("click", () => setQuickOpen($("quickPanel").hidden));
-$("quickManage").addEventListener("click", () => {
-  if (!$("quickEditor").hidden) { showEditor(false); renderQuick(); return; }  // 完成管理: back to the questions
-  if ($("quickPanel").hidden) { $("quickPanel").hidden = false; $("quickToggle").setAttribute("aria-expanded", "true"); }
+byId("quickToggle").addEventListener("click", () => setQuickOpen(byId("quickPanel").hidden));
+byId("quickManage").addEventListener("click", () => {
+  if (!byId("quickEditor").hidden) { showEditor(false); renderQuick(); return; }  // 完成管理: back to the questions
+  if (byId("quickPanel").hidden) { byId("quickPanel").hidden = false; byId("quickToggle").setAttribute("aria-expanded", "true"); }
   renderEditor();
 });
-$("quickPanel").addEventListener("keydown", (e) => { if (e.key === "Escape") { setQuickOpen(false); $("quickToggle").focus(); } });
+byId("quickPanel").addEventListener("keydown", (e) => { if (e.key === "Escape") { setQuickOpen(false); byId("quickToggle").focus(); } });
 function showGreeting() {
-  const hello = `你好${auth.user.name ? "，" + escapeHtml(auth.user.name) : ""}。`;
-  add("bot", IN_DASHBOARD
-    ? `<p>${hello}我可以按当前控件的筛选查询这个仪表盘的数据、计算并画图，提示控件该选什么值。这里是已发布的仪表盘，不能修改图表：要改请到对应的分析里，改完重新发布仪表盘。不知道问什么时，点输入框下方的“示例问题”。</p>`
-    : `<p>${hello}我可以按当前控件的筛选查询这个分析的数据、计算并画图，提示控件该选什么值，也可以预览并修改分析里的图表。不知道问什么时，点输入框下方的“示例问题”展开常用问题。</p>`);
+  const hello = "你好" + (auth.user.name ? "，" + auth.user.name : "") + "。";
+  addMessage("bot", el("p", null, hello, IN_DASHBOARD
+    ? "我可以按当前控件的筛选查询这个仪表盘的数据、计算并画图，提示控件该选什么值。这里是已发布的仪表盘，不能修改图表：要改请到对应的分析里，改完重新发布仪表盘。不知道问什么时，点输入框下方的“示例问题”。"
+    : "我可以按当前控件的筛选查询这个分析的数据、计算并画图，提示控件该选什么值，也可以预览并修改分析里的图表。不知道问什么时，点输入框下方的“示例问题”展开常用问题。"));
 }
 let loginBox = null;
 function showLogin(message) {
   setInputEnabled(false);
   if (loginBox) loginBox.remove();
-  loginBox = add("bot", `<p>${escapeHtml(message || "请使用 IAM Identity Center 账号登录后提问。")}</p><button type="button" id="loginBtn">使用 Identity Center 登录</button><p class="note" id="loginNote">已登录 QuickSight 时，弹窗通常会自动完成，无需再次输入密码。</p>`, "login");
+  loginBox = addMessage("bot", [el("p", null, message || "请使用 IAM Identity Center 账号登录后提问。"),
+    el("button", { type: "button", id: "loginBtn" }, "使用 Identity Center 登录"),
+    el("p", { class: "note", id: "loginNote" }, "已登录 QuickSight 时，弹窗通常会自动完成，无需再次输入密码。")], "login");
   loginBox.querySelector("#loginBtn").addEventListener("click", startLogin);
 }
 function startLogin() {
@@ -328,12 +293,12 @@ function startLogin() {
       return;
     }
     auth = { token: data.token, user: data.user };
-    localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+    sessionStorage.setItem(AUTH_KEY, JSON.stringify(auth));
     if (loginBox) { loginBox.remove(); loginBox = null; }
     // Redraw from this browser's saved conversation (also after an expiry) and pick up an answer still running.
     history.length = 0;
-    $("log").innerHTML = "";
-    renderWho(); startSession(true); $("q").focus();
+    byId("log").replaceChildren();
+    renderWho(); startSession(true); byId("q").focus();
   };
   window.addEventListener("message", onMessage);
   const watch = setInterval(() => {
@@ -347,16 +312,16 @@ function startLogin() {
 }
 
 // ---- Control suggestions: QuickSight does not let this iframe change controls, so list what to pick ----
-function controlsHtml(controls) {
-  if (!controls || !controls.length) return "";
+function controlsNode(controls) {
+  if (!controls || !controls.length) return null;
   const applied = controls.every((c) => c.value === (parameters[c.parameter] || ""));
   const items = controls.map((c) => {
     const done = c.value === (parameters[c.parameter] || "");
-    const copy = c.value.length > 12 ? ` <button type="button" class="copy" data-copy="${escapeHtml(c.value)}">复制</button>` : "";
-    return `<li>${done ? "✓ " : ""}<strong>${escapeHtml(c.control)}</strong>：<code>${escapeHtml(c.value)}</code>${copy}</li>`;
-  }).join("");
+    const copy = c.value.length > 12 ? [" ", el("button", { type: "button", class: "copy", dataset: { copy: c.value } }, "复制")] : null;
+    return el("li", null, done ? "✓ " : null, el("strong", null, c.control), "：", el("code", null, c.value), copy);
+  });
   const head = applied ? "✓ 当前控件已是这些值" : "在上方控件中选择以下值，页面会刷新出对应结果：";
-  return `<div class="box${applied ? " done" : ""}"><p class="head">${head}</p><ul>${items}</ul></div>`;
+  return el("div", { class: applied ? "box done" : "box" }, el("p", { class: "head" }, head), el("ul", null, items));
 }
 function copyText(text, button) {
   const done = (ok) => { button.textContent = ok ? "已复制" : "请手动复制"; setTimeout(() => { button.textContent = "复制"; }, 1600); };
@@ -407,39 +372,41 @@ function chartOption(spec) {
 }
 function changeText(change) { return change.summary || `把“${change.title}”改为${change.to}`; }  // older history entries
 // turn.changes[id]: "applied" | "discarded" | {status: "published" | "kept", note}
-function previewHtml(change, state) {
-  if (!change) return "";
+function previewNode(change, state) {
+  if (!change) return null;
   const status = state && typeof state === "object" ? state.status : state;
-  const done = `✓ 已应用到分析：${escapeHtml(changeText(change))}。请手动刷新页面查看。`;
-  if (status === "published") return `<div class="box done"><p>${done}</p><p class="note">✓ ${escapeHtml(state.note || "已发布到仪表盘")}</p></div>`;
-  if (status === "kept") return `<div class="box done"><p>${done}</p><p class="note">没有发布仪表盘；需要时在 QuickSight 里发布，或再改一次后点“发布到仪表盘”。</p></div>`;
+  const done = "✓ 已应用到分析：" + changeText(change) + "。请手动刷新页面查看。";
+  const button = (cls, text) => el("button", { type: "button", class: cls }, text);
+  if (status === "published") return el("div", { class: "box done" }, el("p", null, done), el("p", { class: "note" }, "✓ " + (state.note || "已发布到仪表盘")));
+  if (status === "kept") return el("div", { class: "box done" }, el("p", null, done), el("p", { class: "note" }, "没有发布仪表盘；需要时在 QuickSight 里发布，或再改一次后点“发布到仪表盘”。"));
   if (status === "applied") {
-    if (IN_DASHBOARD) return `<div class="box done"><p>${done}</p></div>`;
-    return `<div class="box done" data-publish="${escapeHtml(change.id)}"><p>${done}</p>
-      <p class="note">仪表盘不会自动更新。要把分析的当前内容发布到由它发布的仪表盘吗？</p>
-      <button type="button" class="primary publish-dashboard">发布到仪表盘</button><button type="button" class="skip-publish">不用了</button></div>`;
+    if (IN_DASHBOARD) return el("div", { class: "box done" }, el("p", null, done));
+    return el("div", { class: "box done", dataset: { publish: change.id } }, el("p", null, done),
+      el("p", { class: "note" }, "仪表盘不会自动更新。要把分析的当前内容发布到由它发布的仪表盘吗？"),
+      button("primary publish-dashboard", "发布到仪表盘"), button("skip-publish", "不用了"));
   }
-  if (status === "discarded") return `<div class="box off"><p>已放弃，分析未修改。</p></div>`;
-  if (Date.now() / 1000 > change.expires_at) return `<div class="box off"><p>预览已过期，分析未修改。需要的话请重新提出修改。</p></div>`;
-  return `<div class="box" data-change="${escapeHtml(change.id)}"><p>预览：${escapeHtml(changeText(change))}。分析尚未修改。</p>
-    <button type="button" class="primary apply-change">应用到分析</button><button type="button" class="discard-change">不用了</button></div>`;
+  if (status === "discarded") return el("div", { class: "box off" }, el("p", null, "已放弃，分析未修改。"));
+  if (Date.now() / 1000 > change.expires_at) return el("div", { class: "box off" }, el("p", null, "预览已过期，分析未修改。需要的话请重新提出修改。"));
+  return el("div", { class: "box", dataset: { change: change.id } }, el("p", null, "预览：" + changeText(change) + "。分析尚未修改。"),
+    button("primary apply-change", "应用到分析"), button("discard-change", "不用了"));
 }
-function chartsHtml(list, turn) {
+function chartsNodes(list, turn) {
   return (list || []).map((spec, i) => {
-    const notes = (spec.notes || []).map((n) => `<p class="note">${escapeHtml(n)}</p>`).join("");
+    const notes = (spec.notes || []).map((n) => el("p", { class: "note" }, n));
     const status = spec.pending_change && turn.changes ? turn.changes[spec.pending_change.id] : undefined;
     let chart;
     if (spec.type === "table") {
-      const head = (spec.columns || []).map((c) => `<th>${escapeHtml(c)}</th>`).join("");
-      const body = (spec.rows || []).map((r) => `<tr>${r.map((v) => `<td>${escapeHtml(v ?? "")}</td>`).join("")}</tr>`).join("");
-      chart = `<p class="head">${escapeHtml(spec.title)}</p><div class="ptable"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+      const head = el("tr", null, (spec.columns || []).map((c) => el("th", null, c)));
+      const body = (spec.rows || []).map((r) => el("tr", null, r.map((v) => el("td", null, v ?? ""))));
+      chart = [el("p", { class: "head" }, spec.title),
+        el("div", { class: "ptable" }, el("table", null, el("thead", null, head), el("tbody", null, body)))];
     } else if (spec.type === "none") {
-      chart = `<p class="head">${escapeHtml(spec.title)}</p>`;
+      chart = el("p", { class: "head" }, spec.title);
     } else {
-      chart = `<div class="chart" role="img" aria-label="${escapeHtml(spec.title)}"></div>`;
+      chart = el("div", { class: "chart", role: "img", "aria-label": spec.title });
     }
-    return `<div class="chartbox" data-chart="${i}">${chart}${notes}${previewHtml(spec.pending_change, status)}</div>`;
-  }).join("");
+    return el("div", { class: "chartbox", dataset: { chart: i } }, chart, notes, previewNode(spec.pending_change, status));
+  });
 }
 function mountCharts(container, list, turn) {
   if (!list || !list.length) return;
@@ -462,9 +429,7 @@ function wireChangeBox(box, list, turn) {
     const change = list.find((c) => c.pending_change && c.pending_change.id === id).pending_change;
     const settle = (status) => {
       turn.changes = { ...(turn.changes || {}), [id]: status }; saveHistory();
-      const holder = document.createElement("div");
-      holder.innerHTML = previewHtml(change, status);
-      const next = holder.firstElementChild;
+      const next = previewNode(change, status);
       box.replaceWith(next);
       if (next.matches(".box[data-publish]")) wireChangeBox(next, list, turn);
     };
@@ -522,19 +487,19 @@ async function api(path, options = {}) {
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
-function answerHtml(turn) {
-  const steps = (turn.steps || []).map((s) => `<li>${s.ok ? "✓" : "✕"} <code>${escapeHtml(s.tool)}</code> ${escapeHtml(JSON.stringify(s.arguments))}</li>`).join("");
-  const stats = turn.totalMs ? ` · ${(turn.totalMs / 1000).toFixed(1)} 秒 · ${escapeHtml(turn.model || "")}` : "";
-  return render(turn.content || "（无回答）") + chartsHtml(turn.charts, turn) + controlsHtml(turn.controls)
-    + (steps ? `<details class="steps"><summary>工具调用 ${turn.steps.length} 次${stats}</summary><ul>${steps}</ul></details>` : "");
+function answerNode(turn) {
+  const steps = (turn.steps || []).map((s) => el("li", null, s.ok ? "✓" : "✕", " ", el("code", null, s.tool), " ", JSON.stringify(s.arguments)));
+  const stats = turn.totalMs ? " · " + (turn.totalMs / 1000).toFixed(1) + " 秒 · " + (turn.model || "") : "";
+  return fragment(markdown(turn.content || "（无回答）"), chartsNodes(turn.charts, turn), controlsNode(turn.controls),
+    steps.length ? el("details", { class: "steps" }, el("summary", null, "工具调用 " + turn.steps.length + " 次" + stats), el("ul", null, steps)) : null);
 }
 async function ask(prompt, resumeJob) {
   if (!auth) { showLogin(); return; }
   if (sessionExpired()) { expire(); return; }
   if (!ANALYSIS) { showBindChooser(); return; }
-  $("send").disabled = true;
+  byId("send").disabled = true;
   addUser(prompt);
-  const pending = add("bot", `<span class="typing">${resumeJob ? "页面已刷新，继续获取回答…" : "正在查询数据…"}</span>`);
+  const pending = addMessage("bot", el("span", { class: "typing" }, resumeJob ? "页面已刷新，继续获取回答…" : "正在查询数据…"));
   const started = resumeJob ? resumeJob.at : Date.now();
   try {
     let job = resumeJob;
@@ -563,7 +528,7 @@ async function ask(prompt, resumeJob) {
     if (result.status !== "SUCCEEDED") throw new Error(result.error || "任务失败");
     const turn = { role: "assistant", content: result.answer || "", charts: result.charts || null, controls: result.controls || null,
                    steps: result.steps || [], totalMs: result.totalMs, model: result.model, changes: {} };
-    pending.innerHTML = answerHtml(turn);
+    pending.replaceChildren(answerNode(turn));
     mountCharts(pending, turn.charts, turn);
     history.push({ role: "user", content: prompt }, turn);
     saveHistory();
@@ -577,25 +542,25 @@ async function ask(prompt, resumeJob) {
     pending.className = "msg bot err";
     pending.textContent = `出错：${error.message}`;
   } finally {
-    if (auth) { $("send").disabled = false; $("q").focus(); }
+    if (auth) { byId("send").disabled = false; byId("q").focus(); }
   }
 }
-$("form").addEventListener("submit", (e) => {
+byId("form").addEventListener("submit", (e) => {
   e.preventDefault();
-  const v = $("q").value.trim();
-  if (!v || $("send").disabled) return;
-  $("q").value = "";
+  const v = byId("q").value.trim();
+  if (!v || byId("send").disabled) return;
+  byId("q").value = "";
   ask(v);
 });
-$("q").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); } });
+byId("q").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); byId("form").requestSubmit(); } });
 function replayHistory() {
   const turns = loadHistory();
   if (!turns.length) return;
   history.push(...turns);
-  add("bot", `<p class="typing">已恢复本浏览器 8 小时内的 ${Math.ceil(turns.length / 2)} 轮对话。</p>`);
+  addMessage("bot", el("p", { class: "typing" }, "已恢复本浏览器 8 小时内的 " + Math.ceil(turns.length / 2) + " 轮对话。"));
   for (const turn of turns) {
     if (turn.role === "user") addUser(turn.content);
-    else { const box = add("bot", answerHtml(turn)); mountCharts(box, turn.charts, turn); }
+    else { const box = addMessage("bot", answerNode(turn)); mountCharts(box, turn.charts, turn); }
   }
 }
 function resumePending() {  // a control change reloads this iframe; pick up the answer that was still running
@@ -635,12 +600,13 @@ async function bindTo(box, button, analysisId) {
 }
 async function showBindChooser() {
   setInputEnabled(false);
-  $("q").placeholder = "请先绑定分析";
+  byId("q").placeholder = "请先绑定分析";
   if (IN_DASHBOARD) {
-    add("bot", "<p>这个聊天窗口还没有绑定分析。请到对应的分析里绑定，再重新发布仪表盘。</p>", "err");
+    addMessage("bot", el("p", null, "这个聊天窗口还没有绑定分析。请到对应的分析里绑定，再重新发布仪表盘。"), "err");
     return;
   }
-  const box = add("bot", `<p>这个聊天窗口还没有绑定分析。选择它所在的分析（你刚编辑过的通常排在最前面），绑定后刷新页面即可使用。</p><p class="note">正在列出你可以编辑的分析…</p>`);
+  const box = addMessage("bot", [el("p", null, "这个聊天窗口还没有绑定分析。选择它所在的分析（你刚编辑过的通常排在最前面），绑定后刷新页面即可使用。"),
+    el("p", { class: "note" }, "正在列出你可以编辑的分析…")]);
   try {
     const { analyses } = await api("/bindable");
     box.querySelector(".note").remove();
@@ -667,8 +633,9 @@ async function checkBinding() {  // parameters added or removed since binding: o
     const current = Object.keys(parameters).sort().join(",");
     const viewerMissing = names.includes("pViewer") && !params.has("viewer");
     if (expected === current && !viewerMissing) return;
-    const box = add("bot", `<p>这个分析的参数有变化，聊天窗口拿不到新参数的值。点“更新绑定”后刷新页面即可。</p><div class="hints"><button type="button">更新绑定</button></div>`);
-    const button = box.querySelector("button");
+    const button = el("button", { type: "button" }, "更新绑定");
+    const box = addMessage("bot", [el("p", null, "这个分析的参数有变化，聊天窗口拿不到新参数的值。点“更新绑定”后刷新页面即可。"),
+      el("div", { class: "hints" }, button)]);
     button.onclick = () => bindTo(box, button, ANALYSIS);
   } catch {}  // no view permission or a transient error: the chat works as before
 }

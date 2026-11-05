@@ -20,7 +20,7 @@ import tokens
 ACCOUNT = os.environ["ACCOUNT_ID"]
 QS_REGION = os.environ.get("QS_REGION") or os.environ.get("AWS_REGION")
 NAMESPACE = os.environ.get("QS_NAMESPACE", "default")
-SESSION_SECRET_ID = os.environ["SESSION_SECRET_ID"]
+TOOL_SECRET_ID = os.environ["TOOL_SECRET_ID"]  # verifies tool tokens; the session-token key is not readable here
 ALLOWED_ANALYSES = [a for a in os.environ.get("ALLOWED_ANALYSIS_IDS", "*").split(",") if a]
 CACHE_SECONDS = 60
 ANALYSIS_ID = re.compile(r"^[\w-]{1,512}$")
@@ -42,24 +42,34 @@ def cached(key, loader, seconds=CACHE_SECONDS):
     return value
 
 
-def _session_key():
+def _tool_key():
     def load():
-        raw = boto3.client("secretsmanager").get_secret_value(SecretId=SESSION_SECRET_ID)["SecretString"]
-        return tokens.signing_key(raw)  # same key as web/auth.py
-    return cached("session-key", load, 3600)
+        raw = boto3.client("secretsmanager").get_secret_value(SecretId=TOOL_SECRET_ID)["SecretString"]
+        return tokens.signing_key(raw)  # same key as web/auth.py _tool_key
+    return cached("tool-key", load, 3600)
+
+
+# Set by a Lambda that can read the jobs table (the analysis tools): sid -> True when that browser session signed out.
+revocation_check = None
 
 
 def verify_token(token, analysis):
-    """Check a tool token (tokens.verify: HS256 signature, issuer, audience "qsca:tools", expiry) and that it was
-    issued for `analysis` ("" for the analysis picker). A browser session token is refused. Returns the email."""
+    """Check a tool token (tokens.verify: HS256 signature with the tool key, issuer, audience "qsca:tools", expiry),
+    that it was issued for `analysis` ("" for the analysis picker) and names its browser session (`sid`), and, where
+    revocation_check is set, that the session has not signed out. A browser session token is refused (other key and
+    audience). Returns the email."""
     if not token:
         raise ToolError("缺少已登录用户的身份")
     try:
-        claims = tokens.verify(_session_key(), token, tokens.TOOLS_AUDIENCE, required=("analysis",))
+        claims = tokens.verify(_tool_key(), token, tokens.TOOLS_AUDIENCE, required=("analysis", "sid"))
     except tokens.InvalidToken as error:
         raise ToolError("登录已过期，请重新登录后再试" if error.expired else "用户身份校验失败") from error
+    if not isinstance(claims["sid"], str) or not claims["sid"]:
+        raise ToolError("用户身份校验失败")
     if claims["analysis"] != analysis:
         raise ToolError("用户身份不是为这个分析签发的")
+    if revocation_check is not None and revocation_check(claims["sid"]):
+        raise ToolError("已退出登录，请重新登录后再试")
     return claims["sub"]
 
 

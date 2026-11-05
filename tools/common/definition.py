@@ -42,6 +42,35 @@ def dataset_ids(definition):
     return {d["Identifier"]: d["DataSetArn"].rsplit("/", 1)[-1] for d in definition.get("DataSetIdentifierDeclarations", [])}
 
 
+COLUMN_REFERENCE = re.compile(r"(?<!\$)\{([^{}]+)\}")  # {column} in a calculated field; ${parameter} is not one
+
+
+def referenced_columns(definition):
+    """{dataset id: set of column names} the analysis uses: every {DataSetIdentifier, ColumnName} object anywhere in
+    the definition (field wells, filters, controls, sorts, ...) plus the columns its calculated fields read (a
+    metric-switch preview queries those). The data tool offers only these columns."""
+    ids = dataset_ids(definition)
+    out = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            identifier, column = node.get("DataSetIdentifier"), node.get("ColumnName")
+            if isinstance(identifier, str) and isinstance(column, str) and identifier in ids:
+                out.setdefault(ids[identifier], set()).add(column)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(definition)
+    for field in definition.get("CalculatedFields", []):
+        expression = field.get("Expression") or ""
+        if field.get("DataSetIdentifier") in ids and isinstance(expression, str):
+            names = set(COLUMN_REFERENCE.findall(expression)) | {c for _p, _l, c in SWITCH_BRANCH.findall(expression)}
+            out.setdefault(ids[field["DataSetIdentifier"]], set()).update(n.strip() for n in names)
+    return out
+
+
 def calculated_fields(definition):
     return {(c.get("DataSetIdentifier"), c["Name"]): c.get("Expression", "") for c in definition.get("CalculatedFields", [])}
 

@@ -1,8 +1,10 @@
 """Unit tests for the pure modules (no AWS). Run: python3 -m unittest discover -s tests/unit"""
 
+import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for sub in ("tools/data", "tools/common", "agent"):
@@ -52,9 +54,9 @@ class SqlCompileTest(unittest.TestCase):
         sql, params, _out, _limit = sc.compile_query(
             {"metrics": [{"agg": "count"}], "time": {"column": "t", "grain": "month"},
              "filters": [{"column": "note", "op": "contains", "value": "50%_off"}]},
-            COLUMNS, {"sql": "SELECT * FROM x"}, sc.DIALECTS["mysql"])
+            COLUMNS, TABLE, sc.DIALECTS["mysql"])
         self.assertIn("DATE_FORMAT(`data_time`, '%%Y-%%m-01')", sql)
-        self.assertIn("FROM (SELECT * FROM x) AS `__src`", sql)
+        self.assertIn("FROM `public`.`trade`", sql)
         self.assertIn("LIKE %(p0)s", sql)
         self.assertEqual(params["p0"], "%50\\%\\_off%")
 
@@ -71,6 +73,34 @@ class SqlCompileTest(unittest.TestCase):
         for spec in bad:
             with self.assertRaises(sc.QueryError, msg=spec):
                 sc.compile_query(spec, COLUMNS, TABLE, dialect)
+
+    def test_rejects_unknown_keys_bad_values_and_custom_sql(self):
+        dialect = sc.DIALECTS["postgresql"]
+        metric = {"column": "price", "agg": "sum"}
+        bad = [
+            {"metrics": [metric], "raw_sql": "1"},
+            {"metrics": [{**metric, "expr": "price*2"}]},
+            {"metrics": [metric], "time": {"column": "t", "grain": "day", "tz": "x"}},
+            {"metrics": [metric], "filters": [{"column": "station", "op": "eq", "value": "A", "or": "1=1"}]},
+            {"metrics": [metric], "order_by": [{"name": "price", "desc": True, "nulls": "first"}]},
+            {"metrics": [{"column": "price", "agg": ["sum"]}]},
+        ]
+        bad += [{"metrics": [metric], "filters": [{"column": "price", "op": "eq", "value": v}]}
+                for v in (True, float("nan"), float("inf"), {"a": 1}, "x" * (sc.MAX_VALUE_LENGTH + 1), ["A", "B"])]
+        bad += [{"metrics": [metric], "filters": [{"column": "station", "op": "in", "values": ["A", False]}]},
+                {"metrics": [metric], "filters": [{"column": "price", "op": "between", "values": [float("nan"), 1]}]},
+                {"metrics": [metric], "filters": [{"column": "price", "op": "between", "values": [[1], 2]}]},
+                {"metrics": [metric], "limit": float("inf")}]
+        for spec in bad:
+            with self.assertRaises(sc.QueryError, msg=spec):
+                sc.compile_query(spec, COLUMNS, TABLE, dialect)
+        with self.assertRaises(sc.QueryError):
+            sc.compile_query({"metrics": [metric]}, COLUMNS, {"sql": "SELECT * FROM x"}, dialect)
+        _sql, params, _o, _l = sc.compile_query(  # numbers and a one-element list are still fine
+            {"metrics": [metric], "filters": [{"column": "price", "op": "gt", "value": [1.5]},
+                                              {"column": "station", "op": "eq", "value": "x" * sc.MAX_VALUE_LENGTH}]},
+            COLUMNS, TABLE, dialect)
+        self.assertEqual(params["p0"], 1.5)
 
     def test_values_are_never_inlined(self):
         sql, params, _o, _l = sc.compile_query(
@@ -125,6 +155,20 @@ class DatasetPlanTest(unittest.TestCase):
         rules = [{"Principals": ["arn:user/boss"], "ColumnNames": ["secret"]}]
         self.assertNotIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/a"])["columns"])
         self.assertIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/boss"])["columns"])
+
+    def test_custom_sql_is_unsupported(self):
+        custom = dataset_body(PhysicalTableMap={"p1": {"CustomSql": {"DataSourceArn": "arn:ds/s1", "Name": "q",
+                                                                    "SqlQuery": "SELECT * FROM trade",
+                                                                    "Columns": [{"Name": "price", "Type": "DECIMAL"}]}}})
+        with self.assertRaisesRegex(ds.Unsupported, "Custom SQL"):
+            ds.plan(custom, [])
+
+    def test_only_columns_the_analysis_references(self):
+        plan = ds.plan(dataset_body(), ["arn:user/a"], referenced={"station"})
+        self.assertEqual(list(plan["columns"]), ["station"])
+        self.assertEqual(plan["hidden"], [])  # unreferenced columns are not even named
+        self.assertIn("只列出分析里用到的列", plan["notes"])
+        self.assertEqual(set(ds.plan(dataset_body(), [])["columns"]), {"station", "price", "secret"})
 
     def test_connection_parameters(self):
         info = ds.connection({"Type": "POSTGRESQL", "DataSourceParameters": {"PostgreSqlParameters": {
@@ -207,10 +251,64 @@ class DefinitionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             defs.replace_chart_type(d, "nope", "BarChartVisual")
 
+    def test_referenced_columns(self):
+        refs = defs.referenced_columns(analysis_definition())
+        self.assertEqual(set(refs), {"d1"})
+        # field wells, filters and controls, plus the real columns the metric-switch calculated field reads
+        self.assertTrue({"station", "t", "price", "elec"} <= refs["d1"], refs)
+
     def test_model_view(self):
         view = defs.strip_for_model(analysis_definition())
         self.assertEqual(view["datasets"], {"trade": "d1"})
         self.assertEqual([v["visual_id"] for v in view["sheets"][0]["visuals"]], ["v1", "v2", "v3"])
+
+
+def _data_handler():
+    for key, value in (("ACCOUNT_ID", "1"), ("QS_REGION", "cn-north-1"), ("AWS_REGION", "cn-north-1"),
+                       ("TOOL_SECRET_ID", "y")):
+        os.environ.setdefault(key, value)
+    spec = importlib.util.spec_from_file_location("data_handler", os.path.join(ROOT, "tools", "data", "handler.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class DataHandlerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _data_handler()
+
+    def test_secret_is_only_the_assistant_secret(self):
+        asked = []
+
+        class Secrets:
+            def get_secret_value(self, SecretId):  # noqa: N803
+                asked.append(SecretId)
+                if SecretId != "quicksight-chat-assistant/datasource/s1":
+                    raise RuntimeError("not found")
+                return {"SecretString": '{"username": "reader", "password": "p"}'}
+        source = {"DataSourceId": "s1", "SecretArn": "arn:aws-cn:secretsmanager:cn-north-1:1:secret:qs-owned"}
+        with mock.patch.object(self.data.boto3, "client", lambda *a, **k: Secrets()):
+            self.assertEqual(self.data._secret(source), ("reader", "p"))
+            with self.assertRaisesRegex(self.data.ToolError, "datasource-secret s2"):
+                self.data._secret({**source, "DataSourceId": "s2"})
+        self.assertEqual(asked, ["quicksight-chat-assistant/datasource/s1", "quicksight-chat-assistant/datasource/s2"])
+
+    def test_describe_lists_only_referenced_columns(self):
+        class QuickSight:
+            def describe_analysis_definition(self, **_):
+                return {"Definition": analysis_definition()}
+
+            def describe_data_set(self, **_):
+                return {"DataSet": dataset_body()}
+        caller = self.data.caller
+        with mock.patch.object(caller, "require_viewer", lambda args: ("a@example.com", "a1")), \
+                mock.patch.object(caller, "cached", lambda key, loader, seconds=60: loader()), \
+                mock.patch.object(caller, "principals", lambda email: {"arn:user/a"}), \
+                mock.patch.object(self.data, "qs", QuickSight()):
+            out = self.data.describe_dataset({"dataset_id": "d1", "_caller": "t", "_analysis": "a1"})
+        self.assertEqual([c["name"] for c in out["columns"]], ["price", "station"])  # not "secret"
+        self.assertNotIn("secret", out["hidden_columns"])
 
 
 class ChartsTest(unittest.TestCase):
