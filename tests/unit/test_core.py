@@ -96,11 +96,35 @@ class SqlCompileTest(unittest.TestCase):
                 sc.compile_query(spec, COLUMNS, TABLE, dialect)
         with self.assertRaises(sc.QueryError):
             sc.compile_query({"metrics": [metric]}, COLUMNS, {"sql": "SELECT * FROM x"}, dialect)
-        _sql, params, _o, _l = sc.compile_query(  # numbers and a one-element list are still fine
-            {"metrics": [metric], "filters": [{"column": "price", "op": "gt", "value": [1.5]},
+        _sql, params, _o, _l = sc.compile_query(  # numbers and strings up to the limit are fine
+            {"metrics": [metric], "filters": [{"column": "price", "op": "gt", "value": 1.5},
                                               {"column": "station", "op": "eq", "value": "x" * sc.MAX_VALUE_LENGTH}]},
             COLUMNS, TABLE, dialect)
         self.assertEqual(params["p0"], 1.5)
+
+    def test_operands_must_fit_the_operator(self):
+        dialect = sc.DIALECTS["postgresql"]
+        metric = {"column": "price", "agg": "sum"}
+        bad = [
+            {"column": "price", "op": "gt", "value": [1.5]},  # lists only for in / not_in / between
+            {"column": "station", "op": "eq", "values": ["A"]},
+            {"column": "station", "op": "contains", "value": "A", "values[]": ["B"]},
+            {"column": "station", "op": "eq"},
+            {"column": "note", "op": "is_null", "value": "x"},  # null operators take no operand
+            {"column": "note", "op": "not_null", "values": ["x"]},
+            {"column": "note", "op": "is_null", "values[]": []},
+            {"column": "station", "op": "in", "values": ["A"], "value": "B"},  # one operand per filter
+        ]
+        for flt in bad:
+            with self.assertRaises(sc.QueryError, msg=flt):
+                sc.compile_query({"metrics": [metric], "filters": [flt]}, COLUMNS, TABLE, dialect)
+        sql, params, _o, _l = sc.compile_query(
+            {"metrics": [metric], "filters": [{"column": "note", "op": "is_null", "value": None},
+                                              {"column": "station", "op": "not_null"},
+                                              {"column": "station", "op": "in", "value": ["A"]}]},
+            COLUMNS, TABLE, dialect)
+        self.assertIn('"note" IS NULL AND "station_code" IS NOT NULL AND "station_code" IN (:p0)', sql)
+        self.assertEqual(params, {"p0": "A"})
 
     def test_values_are_never_inlined(self):
         sql, params, _o, _l = sc.compile_query(
@@ -226,6 +250,8 @@ class DefinitionTest(unittest.TestCase):
         self.assertEqual(query["metrics"], [{"column": "elec", "agg": "avg"}])
         self.assertEqual(query["time"], {"column": "t", "grain": "day"})
         self.assertEqual(query["filters"], [{"column": "station", "op": "eq", "value": "ST1"}])
+        query = defs.preview_query(analysis_definition(), "v1", {"pMetric": "电量", "pStation": ["ST1"]})["query"]
+        self.assertEqual(query["filters"], [{"column": "station", "op": "eq", "value": "ST1"}])  # not a list for eq
 
     def test_preview_skips_all_values_and_reports_unsupported(self):
         query = defs.preview_query(analysis_definition(), "v1", {"pMetric": "价格", "pStation": "全部"})["query"]
@@ -309,6 +335,18 @@ class DataHandlerTest(unittest.TestCase):
             out = self.data.describe_dataset({"dataset_id": "d1", "_caller": "t", "_analysis": "a1"})
         self.assertEqual([c["name"] for c in out["columns"]], ["price", "station"])  # not "secret"
         self.assertNotIn("secret", out["hidden_columns"])
+
+    def test_query_refuses_unknown_top_level_keys(self):
+        envelope = {"dataset_id": "d1", "_caller": "t", "_analysis": "a1", "_parameters": {}}
+        spec = {"metrics": [{"agg": "count"}], "dimensions": ["station"], "limit": 10}
+        with mock.patch.object(self.data, "_dataset", side_effect=AssertionError("must be refused before access")):
+            out = self.data.handler({"__tool": "query_dataset", **envelope, **spec, "raw_sql": "DELETE FROM trade"}, None)
+        self.assertIn("不支持的参数：raw_sql", out["error"])
+        seen = []
+        with mock.patch.object(self.data, "_dataset", lambda args: ({"DataSetId": "d1"}, {})), \
+                mock.patch.object(self.data, "_execute", lambda plan, s: seen.append(s) or {"row_count": 0, "elapsed_ms": 0}):
+            self.assertEqual(self.data.handler({"__tool": "query_dataset", **envelope, **spec}, None)["row_count"], 0)
+        self.assertEqual({k: v for k, v in seen[0].items() if v is not None}, spec)
 
 
 class ChartsTest(unittest.TestCase):

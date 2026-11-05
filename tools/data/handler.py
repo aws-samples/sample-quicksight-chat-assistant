@@ -32,6 +32,8 @@ SECRET_PREFIX = os.environ.get("DATASOURCE_SECRET_PREFIX", "quicksight-chat-assi
 CA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rds-ca.pem")
 qs = caller.qs
 _connections = {}
+# query_dataset input: the QuerySpec, the dataset and the fields the Runtime sets in code (agent/main.py WithCaller).
+QUERY_ARGS = {"dataset_id", "_caller", "_analysis", "_parameters", *sqlcompile.SPEC_KEYS}
 
 
 def _dataset(args):
@@ -150,7 +152,9 @@ def _execute(plan, spec):
         raise ToolError(str(error)) from error
     started = time.time()
     try:
-        _names, rows = conn["run"](sql, params)
+        # The one execution point of generated SQL: compile_query formats in only quoted planned identifiers and fixed
+        # allowlisted fragments, and every value stays a bound driver parameter.
+        _names, rows = conn["run"](sql, params)  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query
     except Exception:
         _connections.pop(plan["data_source_arn"].rsplit("/", 1)[-1], None)
         raise
@@ -161,6 +165,10 @@ def _execute(plan, spec):
 
 
 def query_dataset(args):
+    unknown = sorted(str(k) for k in args if k not in QUERY_ARGS)
+    if unknown:  # refused, not dropped: the compiler only sees the QuerySpec keys below
+        raise ToolError(f"query_dataset 不支持的参数：{', '.join(unknown)[:200]}。只接受 dataset_id、"
+                        + "、".join(sorted(sqlcompile.SPEC_KEYS)))
     description, plan = _dataset(args)
     spec = {k: args.get(k) for k in ("metrics", "dimensions", "time", "filters", "order_by", "limit")}
     result = _execute(plan, spec)

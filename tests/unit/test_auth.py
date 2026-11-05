@@ -409,7 +409,9 @@ class WebLogoutTest(unittest.TestCase):
         out = self.call("POST", "/auth/logout", {})
         self.assertEqual((out["statusCode"], json.loads(out["body"])["cancelled"]), (200, 2))
         self.assertEqual([self.table.items[i]["status"] for i in ids], ["CANCELLED", "CANCELLED"])
-        self.assertIn(f"revoked#{jti}", self.table.items)
+        # the record outlives the job tool tokens (8 h), not just the 1-hour session token
+        self.assertGreaterEqual(self.table.items[f"revoked#{jti}"]["expiresAt"],
+                                int(time.time()) + self.web.JOB_TOKEN_SECONDS)
         self.assertEqual(self.call("GET", "/me")["statusCode"], 401)
         try:  # the analysis tools' hook (tools/analysis/handler.py) reads the same revoked# record
             caller._cache["tool-key"] = (time.time(), TOOL_KEY)

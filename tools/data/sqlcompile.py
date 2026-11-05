@@ -3,7 +3,8 @@
 The model never writes SQL. It sends {metrics, dimensions, time, filters, order_by, limit}; unknown keys are refused,
 every identifier must be a known dataset column (mapped to its physical expression), every aggregate and operator
 comes from a fixed list, and every value is a bound parameter: a string of at most MAX_VALUE_LENGTH characters or a
-finite number (lists only for in / not_in / between). The relation is always one quoted table, never custom SQL.
+finite number (lists only for in / not_in / between; is_null / not_null take none). The relation is always one
+quoted table, never custom SQL.
 """
 
 import math
@@ -13,6 +14,7 @@ AGGS = {"sum": "SUM({})", "avg": "AVG({})", "min": "MIN({})", "max": "MAX({})", 
         "count_distinct": "COUNT(DISTINCT {})"}
 GRAINS = ("hour", "day", "week", "month", "quarter", "year")
 OPS = ("eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte", "between", "contains", "is_null", "not_null")
+LIST_OPS, NULL_OPS = ("in", "not_in", "between"), ("is_null", "not_null")
 MAX_METRICS, MAX_DIMENSIONS, MAX_FILTERS, MAX_IN_VALUES, MAX_LIMIT = 10, 3, 12, 200, 500
 MAX_VALUE_LENGTH = 500
 DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -134,6 +136,27 @@ def _scalar(value):
     raise QueryError(f"过滤值只能是字符串（最多 {MAX_VALUE_LENGTH} 个字符）或有限的数字")
 
 
+def _operand(flt, op):
+    """The filter's operand in the shape its operator takes, and nothing else: none for is_null / not_null, a list for
+    in / not_in / between ("values", a garbled "values..." key, or "value"), one scalar "value" for the rest."""
+    listed = [k for k, v in flt.items() if v is not None and isinstance(k, str) and k.strip().startswith("values")]
+    given = flt.get("value") is not None
+    if op in NULL_OPS:
+        if given or listed:
+            raise QueryError(f"{op} 不需要 value 或 values")
+        return None
+    if op in LIST_OPS:
+        if given and listed:
+            raise QueryError(f'{op} 只用 "values"，不要同时给 value')
+        return _list_value(flt)  # schema: "values" is the list form
+    if listed:
+        raise QueryError(f'{op} 需要单个 "value"；列表（values）只用于 in、not_in 和 between')
+    value = flt.get("value")
+    if value is None or isinstance(value, (list, dict)):
+        raise QueryError(f"{op} 需要单个值")
+    return _scalar(value)
+
+
 def compile_query(spec, columns, source, dialect):
     """Return (sql, params, output_columns).
 
@@ -215,13 +238,10 @@ def compile_query(spec, columns, source, dialect):
             raise QueryError(f"filters[].op 只能是 {', '.join(OPS)}")
         _known_keys(flt, FILTER_KEYS, "filters[]")
         expression, info = column(flt.get("column"), "filters ")
-        op, value = flt["op"], flt.get("value")
-        if op in ("in", "not_in", "between"):
-            value = _list_value(flt)  # schema: "values" is the list form
-        elif isinstance(value, list) and len(value) == 1:
-            value = value[0]
+        op = flt["op"]
+        value = _operand(flt, op)
         is_time = info["type"] in ("DATETIME", "DATE")
-        if op in ("is_null", "not_null"):
+        if op in NULL_OPS:
             where.append(f"{expression} IS {'NOT ' if op == 'not_null' else ''}NULL")
             continue
         if op in ("in", "not_in"):
@@ -240,9 +260,6 @@ def compile_query(spec, columns, source, dialect):
             else:
                 where.append(f"{expression} BETWEEN {bind(low)} AND {bind(high)}")
             continue
-        if isinstance(value, (list, dict)) or value is None:
-            raise QueryError(f"{op} 需要单个值")
-        value = _scalar(value)
         if op == "contains":
             where.append(dialect.contains(expression, bind("%" + _escape_like(str(value)) + "%")))
             continue

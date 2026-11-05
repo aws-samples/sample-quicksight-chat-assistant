@@ -157,10 +157,14 @@ def verify_session(token, table):
     return claims
 
 
-def revoke_session(table, claims):
-    """Sign-out: the session token stops working at once; the record expires (TTL) when the token would have."""
-    table.put_item(Item={**_revoked_key(claims["jti"]), "createdAt": int(time.time()),
-                         "expiresAt": int(claims["exp"]) + tokens.LEEWAY_SECONDS + 60})
+def revoke_session(table, claims, tool_token_seconds=0):
+    """Sign-out: the session token stops working at once. The record expires (TTL) only after the session token and
+    every tool token issued under it (at most `tool_token_seconds` from now) would have, so the analysis tools keep
+    refusing those tool tokens (`revoked#<sid>`) for their whole life."""
+    now = int(time.time())
+    until = max(int(claims["exp"]), now + int(tool_token_seconds))
+    table.put_item(Item={**_revoked_key(claims["jti"]), "createdAt": now,
+                         "expiresAt": until + tokens.LEEWAY_SECONDS + 60})
 
 
 def mint_tool_token(subject, analysis, seconds, sid, jti=None):

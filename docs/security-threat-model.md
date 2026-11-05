@@ -69,12 +69,18 @@ also refused rather than merged, because their permissions would be combined. Gr
 The model sends a QuerySpec (`metrics, dimensions, time, filters, order_by, limit`), and `tools/data/sqlcompile.py`
 compiles it into one SELECT:
 
-- Unknown keys are refused in the spec, metric, time, filter and order_by objects. Filters keep the existing
+- Unknown keys are refused, not dropped. `query_dataset` refuses any argument other than `dataset_id`, the three
+  fields the Runtime sets (`_caller`, `_analysis`, `_parameters`) and the QuerySpec keys, before any access check.
+  The compiler refuses unknown keys in the spec, metric, time, filter and order_by objects. Filters keep the existing
   tolerance for garbled `values…` key names.
 - Identifiers must be planned columns. They are mapped to their physical names and quoted for the dialect.
   Aggregates, grains and operators come from fixed lists.
-- Values are always bound parameters: strings of at most 500 characters or finite, non-boolean numbers. Lists are
-  allowed only for `in`/`not_in` (1–200 values) and `between` (2 values). The limit is 1–500 rows.
+- Values are always bound parameters: strings of at most 500 characters or finite, non-boolean numbers. Each filter
+  carries exactly the operand its operator takes (`sqlcompile._operand`): one scalar `value` for `eq`, `ne`, `gt`,
+  `gte`, `lt`, `lte` and `contains`; a list only for `in`/`not_in` (1–200 values) and `between` (2 values); nothing
+  for `is_null`/`not_null`. Any other or extra operand is refused. The limit is 1–500 rows.
+- `tools/data/handler.py` `_execute` is the one place generated SQL is executed, with the parameters passed to the
+  driver separately.
 - The relation is always one quoted `schema.table`. The connection runs a read-only transaction with a constant 20 s
   statement timeout.
 
@@ -115,11 +121,13 @@ in depth, not the control.
 
 ## Sign-out behavior
 
-`POST /auth/logout` writes `revoked#<jti>` until the session would have expired, so the session token stops working
-at once. Each chat job row carries `sid`, and the web Lambda records the sign-in's job IDs in `sessjobs#<jti>` (the
-newest 50). Sign-out cancels the ones still RUNNING through the existing cancel path. The analysis tools refuse every
-tool token whose `sid` is revoked, so a running answer can no longer read or change analyses. The analysis Lambda can
-read only `revoked#*` items for this purpose.
+`POST /auth/logout` writes `revoked#<jti>`, so the session token stops working at once. The record's TTL is the
+later of the session's expiry and now + the job tool-token lifetime (8 h), plus the clock leeway, so it outlives
+every tool token issued under that sign-in. Each chat job row carries `sid`, and the web Lambda records the
+sign-in's job IDs in `sessjobs#<jti>` (the newest 50). Sign-out cancels the ones still RUNNING through the existing
+cancel path. The analysis tools refuse every tool token whose `sid` is revoked, for the token's whole life, so a
+running answer can no longer read or change analyses. The analysis Lambda can read only `revoked#*` items for this
+purpose.
 
 ## Residual risks and future work
 
@@ -176,12 +184,12 @@ comments).
 | 6 | Bandit B110 | agent/sandbox.py:107 | fixed | Logs `code_interpreter_stop_failed` instead of `pass` | agent/sandbox.py:108 |
 | 7 | Bandit B410 | web/auth.py:27 | FP | SignXML requires lxml; every parse goes through `_parse_xml` | web/auth.py:32 |
 | 8 | Bandit B104 | agent/main.py:710 | FP | AgentCore Runtime contract: the container serves 0.0.0.0:8080 inside its microVM | agent/main.py:711 |
-| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound | tools/data/sqlcompile.py:272 |
+| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:289; tools/data/handler.py:157 |
 | 10 | Bandit B410 | tests/unit/test_auth.py:146 | FP | Test fixture (SignXML needs lxml) | tests/unit/test_auth.py:171 |
 | 11 | Bandit B310 | tests/e2e.py:129 | fixed | `_https()` before `urlopen`; `nosec B310` | tests/e2e.py:141 |
 | 12 | Bandit B320 | tests/unit/test_auth.py:209 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:248 |
 | 13 | Semgrep html-in-template-string | web/app.js:537 | fixed | Typing indicator built with `el()` | web/app.js:502 |
-| 14 | Semgrep formatted-sql-query | tools/data/handler.py:110 | fixed | Constant `SET SESSION max_execution_time = 20000` | tools/data/handler.py:110 |
+| 14 | Semgrep formatted-sql-query | tools/data/handler.py:110 | fixed | Constant `SET SESSION max_execution_time = 20000` | tools/data/handler.py:112 |
 | 15 | Semgrep html-in-template-string | web/app.js:434 | fixed | `chartsNodes()` | web/app.js:393 |
 | 16 | Semgrep html-in-template-string | web/app.js:359 | fixed | `controlsNode()` | web/app.js:315 |
 | 17 | Semgrep string-concat-in-list | web/handler.py:96 | fixed | Explicit `+` | web/handler.py:106 |
@@ -190,7 +198,7 @@ comments).
 | 20 | Semgrep jquery-insecure-method | web/app.js:278 | fixed | `Node.append` of a button node; no longer reported | web/app.js:241 |
 | 21 | Semgrep insecure-innerhtml (ERROR) | web/app.js:95 | fixed | `addMessage()` builds with `el()` | web/app.js:49 |
 | 22 | Semgrep avoid_app_run_with_bad_host | agent/main.py:710 | FP | As row 8; `nosemgrep` | agent/main.py:711 |
-| 23 | Semgrep directly-returned-format-string | web/auth.py:149 | fixed | AuthnRequest built with lxml elements; redirect URL concatenated with an urlencoded query | web/auth.py:173, :195 |
+| 23 | Semgrep directly-returned-format-string | web/auth.py:149 | fixed | AuthnRequest built with lxml elements; redirect URL concatenated with an urlencoded query | web/auth.py:177, :199 |
 | 24 | Semgrep html-in-template-string | web/app.js:424 | fixed | `previewNode()` | web/app.js:375 |
 | 25 | Semgrep html-in-template-string | web/app.js:526 | fixed | `answerNode()` | web/app.js:490 |
 | 26 | Semgrep html-in-template-string | web/app.js:441 | fixed | `chartsNodes()` | web/app.js:393 |
@@ -201,7 +209,7 @@ comments).
 | 31 | Semgrep insecure-innerhtml (ERROR) | web/app.js:466 | fixed | As row 29 | web/app.js:432 |
 | 32 | Semgrep path-join-resolve-traversal | infra/lib/stack.ts:29 | fixed | As row 27; `nosemgrep` | infra/lib/stack.ts:31 |
 | 33 | Semgrep html-in-template-string | web/app.js:417 | fixed | `previewNode()` | web/app.js:375 |
-| 34 | Semgrep sqlalchemy-execute-raw-query (ERROR) | tools/data/handler.py:110 | fixed | Constant statement | tools/data/handler.py:110 |
+| 34 | Semgrep sqlalchemy-execute-raw-query (ERROR) | tools/data/handler.py:110 | fixed | Constant statement | tools/data/handler.py:112 |
 | 35 | Semgrep html-in-template-string | web/app.js:529 | fixed | `answerNode()` | web/app.js:490 |
 | 36 | Semgrep html-in-template-string | web/app.js:304 | fixed | `showGreeting()` | web/app.js:263 |
 | 37 | Semgrep html-in-template-string | web/app.js:434 | fixed | `chartsNodes()` | web/app.js:393 |
@@ -218,7 +226,7 @@ comments).
 | 48 | Semgrep html-in-template-string | web/app.js:414 | fixed | `previewNode()` | web/app.js:375 |
 | 49 | Semgrep insecure-document-method (ERROR) | web/app.js:95 | fixed | As row 21 | web/app.js:49 |
 | 50 | Semgrep html-in-template-string | web/app.js:435 | fixed | `chartsNodes()` | web/app.js:393 |
-| 51 | Semgrep pg8000-sqli | tools/data/handler.py:98 | fixed | Constant `SET statement_timeout = 20000` | tools/data/handler.py:98 |
+| 51 | Semgrep pg8000-sqli | tools/data/handler.py:98 | fixed | Constant `SET statement_timeout = 20000` | tools/data/handler.py:100 |
 | 52 | Semgrep jquery-insecure-method | web/app.js:144 | fixed | `byId("who").append` of nodes | web/app.js:104 |
 | 53 | Semgrep arbitrary-sleep (ERROR) | tools/analysis/handler.py:76 | fixed | `publisher.wait_until(…, 30, 1)` keeps the 30 s limit | tools/analysis/handler.py:81 |
 | 54 | Semgrep html-in-template-string | web/app.js:418 | fixed | `previewNode()` | web/app.js:375 |

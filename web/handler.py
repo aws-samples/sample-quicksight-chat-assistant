@@ -220,7 +220,7 @@ def _remember_job(user, job_id):
 def logout(user):
     """The 退出 button: this session token stops working at once (other browsers' sessions are not affected), its
     answers still running are cancelled, and the analysis tools refuse its tool tokens (caller.revocation_check)."""
-    auth.revoke_session(jobs, user)
+    auth.revoke_session(jobs, user, JOB_TOKEN_SECONDS)  # job tool tokens outlive the session token
     cancelled = 0
     item = jobs.get_item(Key=_session_jobs_key(user), ConsistentRead=True).get("Item") or {}
     for job_id in item.get("jobIds") or []:

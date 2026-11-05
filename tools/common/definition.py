@@ -313,6 +313,8 @@ def preview_query(definition, visual_id, parameter_values):
             op = role["op"]
             if op == "in" and not isinstance(value, list):
                 value = [value]
+            elif op != "in" and isinstance(value, list) and len(value) == 1:
+                value = value[0]  # a single-valued control; the data tool takes lists only for in / not_in / between
             query["filters"].append({"column": binding["column"], "op": op, "value": value})
     if any(f["dataset"] != dataset for f in fields):
         notes.append("部分字段口径无法确认")
