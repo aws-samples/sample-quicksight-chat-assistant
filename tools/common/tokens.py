@@ -7,11 +7,14 @@ Two kinds of token, told apart by the audience claim; neither is accepted where 
 - session (aud "qsca:session"): the browser's sign-in, issued after IAM Identity Center SAML login. Short-lived
   (SESSION_SECONDS, default 1 hour), accepted only by the web Lambda, revoked on sign-out through its jti.
 - tools (aud "qsca:tools"): issued by the web Lambda for one chat job (lifetime = the Runtime session's maximum
-  lifetime) or one button click (5 minutes). Bound to the user and to one analysis ("analysis" claim, empty for the
-  analysis picker), never sent to the browser, accepted only by the tool Lambdas.
+  lifetime) or one button click (5 minutes). Bound to the user, to one analysis ("analysis" claim, empty for the
+  analysis picker) and to the browser session it was issued under ("sid" = that session token's jti, so the analysis
+  tools refuse it after sign-out); never sent to the browser, accepted only by the tool Lambdas.
 
-The signing key is SHA-256 of the Secrets Manager secret SESSION_SECRET_ID (a random string of at least 32
-characters; the stack generates 64).
+Each kind has its own signing key, SHA-256 of a Secrets Manager secret (a random string of at least 32 characters;
+the stack generates 64): session tokens use SESSION_SECRET_ID (`<prefix>/session-key`, readable only by the web
+Lambda), tool tokens use TOOL_SECRET_ID (`<prefix>/tool-key`, readable by the web Lambda and the tool Lambdas). A tool
+Lambda can therefore verify tool tokens but cannot mint a browser session.
 """
 
 import hashlib
@@ -39,9 +42,9 @@ class InvalidToken(Exception):
 
 
 def signing_key(secret_string):
-    """The HMAC key derived from the session-key secret."""
+    """The HMAC key derived from a signing-key secret (session-key or tool-key)."""
     if not isinstance(secret_string, str) or len(secret_string) < MIN_SECRET_LENGTH:
-        raise RuntimeError(f"session key secret must be at least {MIN_SECRET_LENGTH} characters")
+        raise RuntimeError(f"signing key secret must be at least {MIN_SECRET_LENGTH} characters")
     return hashlib.sha256(secret_string.encode("utf-8")).digest()
 
 

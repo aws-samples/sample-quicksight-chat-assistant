@@ -45,14 +45,30 @@ def mark(definition, chat_url=None):
     return changed
 
 
+def wait_until(fetch, ready, timeout, interval):
+    """Call fetch() until ready(value) is true or `timeout` seconds (monotonic clock) have passed; returns the last
+    value. The one polling loop of the analysis tools and the publisher (QuickSight has no waiter for these)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = fetch()
+        remaining = deadline - time.monotonic()
+        if ready(value) or remaining <= 0:
+            return value
+        # Bounded poll of a QuickSight status: at most `interval` seconds per round, never past the deadline.
+        time.sleep(min(interval, remaining))  # nosemgrep: python.lang.best-practice.sleep.arbitrary-sleep
+
+
+def _in_progress(info):
+    return info["Version"]["Status"].endswith("_IN_PROGRESS")
+
+
 def _settled(dashboard_id, version=None):
-    for _ in range(40):
-        args = {"VersionNumber": version} if version else {}
-        info = qs.describe_dashboard(AwsAccountId=ACCOUNT, DashboardId=dashboard_id, **args)["Dashboard"]
-        if not info["Version"]["Status"].endswith("_IN_PROGRESS"):
-            return info
-        time.sleep(3)
-    raise TimeoutError(f"dashboard {dashboard_id} still in progress")
+    args = {"VersionNumber": version} if version else {}
+    info = wait_until(lambda: qs.describe_dashboard(AwsAccountId=ACCOUNT, DashboardId=dashboard_id, **args)["Dashboard"],
+                      lambda i: not _in_progress(i), 120, 3)
+    if _in_progress(info):
+        raise TimeoutError(f"dashboard {dashboard_id} still in progress")
+    return info
 
 
 def publish_definition(dashboard_id, name, definition, options, description, analysis_id=""):

@@ -1,8 +1,10 @@
 """Unit tests for the pure modules (no AWS). Run: python3 -m unittest discover -s tests/unit"""
 
+import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for sub in ("tools/data", "tools/common", "agent"):
@@ -52,9 +54,9 @@ class SqlCompileTest(unittest.TestCase):
         sql, params, _out, _limit = sc.compile_query(
             {"metrics": [{"agg": "count"}], "time": {"column": "t", "grain": "month"},
              "filters": [{"column": "note", "op": "contains", "value": "50%_off"}]},
-            COLUMNS, {"sql": "SELECT * FROM x"}, sc.DIALECTS["mysql"])
+            COLUMNS, TABLE, sc.DIALECTS["mysql"])
         self.assertIn("DATE_FORMAT(`data_time`, '%%Y-%%m-01')", sql)
-        self.assertIn("FROM (SELECT * FROM x) AS `__src`", sql)
+        self.assertIn("FROM `public`.`trade`", sql)
         self.assertIn("LIKE %(p0)s", sql)
         self.assertEqual(params["p0"], "%50\\%\\_off%")
 
@@ -71,6 +73,70 @@ class SqlCompileTest(unittest.TestCase):
         for spec in bad:
             with self.assertRaises(sc.QueryError, msg=spec):
                 sc.compile_query(spec, COLUMNS, TABLE, dialect)
+
+    def test_rejects_unknown_keys_bad_values_and_custom_sql(self):
+        dialect = sc.DIALECTS["postgresql"]
+        metric = {"column": "price", "agg": "sum"}
+        bad = [
+            {"metrics": [metric], "raw_sql": "1"},
+            {"metrics": [{**metric, "expr": "price*2"}]},
+            {"metrics": [metric], "time": {"column": "t", "grain": "day", "tz": "x"}},
+            {"metrics": [metric], "filters": [{"column": "station", "op": "eq", "value": "A", "or": "1=1"}]},
+            {"metrics": [metric], "order_by": [{"name": "price", "desc": True, "nulls": "first"}]},
+            {"metrics": [{"column": "price", "agg": ["sum"]}]},
+        ]
+        bad += [{"metrics": [metric], "filters": [{"column": "price", "op": "eq", "value": v}]}
+                for v in (True, float("nan"), float("inf"), {"a": 1}, "x" * (sc.MAX_VALUE_LENGTH + 1), ["A", "B"])]
+        bad += [{"metrics": [metric], "filters": [{"column": "station", "op": "in", "values": ["A", False]}]},
+                {"metrics": [metric], "filters": [{"column": "price", "op": "between", "values": [float("nan"), 1]}]},
+                {"metrics": [metric], "filters": [{"column": "price", "op": "between", "values": [[1], 2]}]},
+                {"metrics": [metric], "limit": float("inf")}]
+        for spec in bad:
+            with self.assertRaises(sc.QueryError, msg=spec):
+                sc.compile_query(spec, COLUMNS, TABLE, dialect)
+        with self.assertRaises(sc.QueryError):
+            sc.compile_query({"metrics": [metric]}, COLUMNS, {"sql": "SELECT * FROM x"}, dialect)
+        _sql, params, _o, _l = sc.compile_query(  # numbers and strings up to the limit are fine
+            {"metrics": [metric], "filters": [{"column": "price", "op": "gt", "value": 1.5},
+                                              {"column": "station", "op": "eq", "value": "x" * sc.MAX_VALUE_LENGTH}]},
+            COLUMNS, TABLE, dialect)
+        self.assertEqual(params["p0"], 1.5)
+
+    def test_operands_must_fit_the_operator(self):
+        dialect = sc.DIALECTS["postgresql"]
+        metric = {"column": "price", "agg": "sum"}
+        bad = [
+            {"column": "price", "op": "gt", "value": [1.5]},  # lists only for in / not_in / between
+            {"column": "station", "op": "eq", "values": ["A"]},
+            {"column": "station", "op": "contains", "value": "A", "values[]": ["B"]},
+            {"column": "station", "op": "eq"},
+            {"column": "note", "op": "is_null", "value": "x"},  # null operators take no operand
+            {"column": "note", "op": "not_null", "values": ["x"]},
+            {"column": "note", "op": "is_null", "values[]": []},
+            {"column": "note", "op": "is_null", "value": None},  # a present key is an operand, even when null
+            {"column": "note", "op": "not_null", "values": None},
+            {"column": "station", "op": "eq", "value": "A", "values": None},
+            {"column": "station", "op": "in", "values": ["A"], "value": None},
+            {"column": "station", "op": "in", "values": None},
+            {"column": "station", "op": "in", "values": ["A"], "value": "B"},  # one operand per filter
+            {"column": "station", "op": "in", "values": ["A"], "values[]": [{"x": 1}]},  # one list representation
+            {"column": "station", "op": "in", "values": ["A"], "values 范围内": ["B"]},
+            {"column": "station", "op": "in", "values[]": ["A"], "values 范围内": ["B"]},
+            {"column": "station", "op": "in", "values": None, "values[]": ["A"]},
+            {"column": "station", "op": "in", "values[]": ["A"], "values[0]": "B"},
+            {"column": "price", "op": "between", "values": [1, 2], "values[0]": 3, "values[1]": 4},
+            {"column": "price", "op": "between", "values[0]": 1, " values[0]": 2},  # duplicate index
+        ]
+        for flt in bad:
+            with self.assertRaises(sc.QueryError, msg=flt):
+                sc.compile_query({"metrics": [metric], "filters": [flt]}, COLUMNS, TABLE, dialect)
+        sql, params, _o, _l = sc.compile_query(
+            {"metrics": [metric], "filters": [{"column": "note", "op": "is_null"},
+                                              {"column": "station", "op": "not_null"},
+                                              {"column": "station", "op": "in", "value": ["A"]}]},
+            COLUMNS, TABLE, dialect)
+        self.assertIn('"note" IS NULL AND "station_code" IS NOT NULL AND "station_code" IN (:p0)', sql)
+        self.assertEqual(params, {"p0": "A"})
 
     def test_values_are_never_inlined(self):
         sql, params, _o, _l = sc.compile_query(
@@ -125,6 +191,20 @@ class DatasetPlanTest(unittest.TestCase):
         rules = [{"Principals": ["arn:user/boss"], "ColumnNames": ["secret"]}]
         self.assertNotIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/a"])["columns"])
         self.assertIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/boss"])["columns"])
+
+    def test_custom_sql_is_unsupported(self):
+        custom = dataset_body(PhysicalTableMap={"p1": {"CustomSql": {"DataSourceArn": "arn:ds/s1", "Name": "q",
+                                                                    "SqlQuery": "SELECT * FROM trade",
+                                                                    "Columns": [{"Name": "price", "Type": "DECIMAL"}]}}})
+        with self.assertRaisesRegex(ds.Unsupported, "Custom SQL"):
+            ds.plan(custom, [])
+
+    def test_only_columns_the_analysis_references(self):
+        plan = ds.plan(dataset_body(), ["arn:user/a"], referenced={"station"})
+        self.assertEqual(list(plan["columns"]), ["station"])
+        self.assertEqual(plan["hidden"], [])  # unreferenced columns are not even named
+        self.assertIn("只列出分析里用到的列", plan["notes"])
+        self.assertEqual(set(ds.plan(dataset_body(), [])["columns"]), {"station", "price", "secret"})
 
     def test_connection_parameters(self):
         info = ds.connection({"Type": "POSTGRESQL", "DataSourceParameters": {"PostgreSqlParameters": {
@@ -182,6 +262,8 @@ class DefinitionTest(unittest.TestCase):
         self.assertEqual(query["metrics"], [{"column": "elec", "agg": "avg"}])
         self.assertEqual(query["time"], {"column": "t", "grain": "day"})
         self.assertEqual(query["filters"], [{"column": "station", "op": "eq", "value": "ST1"}])
+        query = defs.preview_query(analysis_definition(), "v1", {"pMetric": "电量", "pStation": ["ST1"]})["query"]
+        self.assertEqual(query["filters"], [{"column": "station", "op": "eq", "value": "ST1"}])  # not a list for eq
 
     def test_preview_skips_all_values_and_reports_unsupported(self):
         query = defs.preview_query(analysis_definition(), "v1", {"pMetric": "价格", "pStation": "全部"})["query"]
@@ -207,10 +289,87 @@ class DefinitionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             defs.replace_chart_type(d, "nope", "BarChartVisual")
 
+    def test_referenced_columns(self):
+        refs = defs.referenced_columns(analysis_definition())
+        self.assertEqual(set(refs), {"d1"})
+        # field wells, filters and controls, plus the real columns the metric-switch calculated field reads
+        self.assertTrue({"station", "t", "price", "elec"} <= refs["d1"], refs)
+
+    def test_brace_text_in_a_string_literal_is_not_a_column_reference(self):
+        d = analysis_definition()
+        d["CalculatedFields"].append({"DataSetIdentifier": "trade", "Name": "label",
+                                      "Expression": "concat({station}, '{secret}', \"{secret} x\", 'it\\'s {secret}')"})
+        self.assertNotIn("secret", defs.referenced_columns(d)["d1"])
+        self.assertIn("station", defs.referenced_columns(d)["d1"])
+        d["CalculatedFields"].append({"DataSetIdentifier": "trade", "Name": "open", "Expression": "concat('{secret}"})
+        self.assertNotIn("secret", defs.referenced_columns(d)["d1"])  # an unterminated literal is still text
+        plan = ds.plan(dataset_body(), ["arn:user/a"], defs.referenced_columns(d)["d1"])
+        self.assertNotIn("secret", plan["columns"])
+
     def test_model_view(self):
         view = defs.strip_for_model(analysis_definition())
         self.assertEqual(view["datasets"], {"trade": "d1"})
         self.assertEqual([v["visual_id"] for v in view["sheets"][0]["visuals"]], ["v1", "v2", "v3"])
+
+
+def _data_handler():
+    for key, value in (("ACCOUNT_ID", "1"), ("QS_REGION", "cn-north-1"), ("AWS_REGION", "cn-north-1"),
+                       ("TOOL_SECRET_ID", "y")):
+        os.environ.setdefault(key, value)
+    spec = importlib.util.spec_from_file_location("data_handler", os.path.join(ROOT, "tools", "data", "handler.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class DataHandlerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _data_handler()
+
+    def test_secret_is_only_the_assistant_secret(self):
+        asked = []
+
+        class Secrets:
+            def get_secret_value(self, SecretId):  # noqa: N803
+                asked.append(SecretId)
+                if SecretId != "quicksight-chat-assistant/datasource/s1":
+                    raise RuntimeError("not found")
+                return {"SecretString": '{"username": "reader", "password": "p"}'}
+        source = {"DataSourceId": "s1", "SecretArn": "arn:aws-cn:secretsmanager:cn-north-1:1:secret:qs-owned"}
+        with mock.patch.object(self.data.boto3, "client", lambda *a, **k: Secrets()):
+            self.assertEqual(self.data._secret(source), ("reader", "p"))
+            with self.assertRaisesRegex(self.data.ToolError, "datasource-secret s2"):
+                self.data._secret({**source, "DataSourceId": "s2"})
+        self.assertEqual(asked, ["quicksight-chat-assistant/datasource/s1", "quicksight-chat-assistant/datasource/s2"])
+
+    def test_describe_lists_only_referenced_columns(self):
+        class QuickSight:
+            def describe_analysis_definition(self, **_):
+                return {"Definition": analysis_definition()}
+
+            def describe_data_set(self, **_):
+                return {"DataSet": dataset_body()}
+        caller = self.data.caller
+        with mock.patch.object(caller, "require_viewer", lambda args: ("a@example.com", "a1")), \
+                mock.patch.object(caller, "cached", lambda key, loader, seconds=60: loader()), \
+                mock.patch.object(caller, "principals", lambda email: {"arn:user/a"}), \
+                mock.patch.object(self.data, "qs", QuickSight()):
+            out = self.data.describe_dataset({"dataset_id": "d1", "_caller": "t", "_analysis": "a1"})
+        self.assertEqual([c["name"] for c in out["columns"]], ["price", "station"])  # not "secret"
+        self.assertNotIn("secret", out["hidden_columns"])
+
+    def test_query_refuses_unknown_top_level_keys(self):
+        envelope = {"dataset_id": "d1", "_caller": "t", "_analysis": "a1", "_parameters": {}}
+        spec = {"metrics": [{"agg": "count"}], "dimensions": ["station"], "limit": 10}
+        with mock.patch.object(self.data, "_dataset", side_effect=AssertionError("must be refused before access")):
+            out = self.data.handler({"__tool": "query_dataset", **envelope, **spec, "raw_sql": "DELETE FROM trade"}, None)
+        self.assertIn("不支持的参数：raw_sql", out["error"])
+        seen = []
+        with mock.patch.object(self.data, "_dataset", lambda args: ({"DataSetId": "d1"}, {})), \
+                mock.patch.object(self.data, "_execute", lambda plan, s: seen.append(s) or {"row_count": 0, "elapsed_ms": 0}):
+            self.assertEqual(self.data.handler({"__tool": "query_dataset", **envelope, **spec}, None)["row_count"], 0)
+        self.assertEqual({k: v for k, v in seen[0].items() if v is not None}, spec)
 
 
 class ChartsTest(unittest.TestCase):

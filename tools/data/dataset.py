@@ -1,10 +1,12 @@
 """Work out, from QuickSight metadata only, how to query a dataset directly at its source, or why that is unsafe.
 
-Supported in this version: a dataset with exactly one physical table (a relational table or custom SQL) on a
+Supported in this version: a dataset with exactly one physical table, a relational table (RelationalTable), on a
 PostgreSQL / Aurora PostgreSQL / MySQL / Aurora MySQL / MariaDB / RDS (PostgreSQL or MySQL) data source, whose logical
-table only projects, renames, casts or tags columns. Anything that would change which rows a user sees in QuickSight
-- joins, dataset filters, row-level security, column-level security the caller is not granted - is refused, because
-querying the source directly would bypass it. Calculated columns are hidden (QuickSight expressions are not SQL).
+table only projects, renames, casts or tags columns. Custom SQL datasets are refused (their SQL would have to be
+embedded in the query). Anything that would change which rows a user sees in QuickSight - joins, dataset filters,
+row-level security, column-level security the caller is not granted - is refused, because querying the source
+directly would bypass it. Calculated columns are hidden (QuickSight expressions are not SQL), and when the caller
+passes `referenced` only the columns the analysis itself uses are offered.
 """
 
 ENGINES = {"POSTGRESQL": "postgresql", "AURORA_POSTGRESQL": "postgresql", "MYSQL": "mysql", "AURORA": "mysql",
@@ -20,8 +22,10 @@ class Unsupported(Exception):
     """The dataset cannot be queried safely by the built-in tool; the message says why."""
 
 
-def plan(dataset, caller_arns):
-    """dataset: DescribeDataSet()["DataSet"]. Returns {"data_source_arn", "source", "columns", "hidden", "notes"}."""
+def plan(dataset, caller_arns, referenced=None):
+    """dataset: DescribeDataSet()["DataSet"]; referenced: column names the analysis definition uses (None: all).
+    Returns {"data_source_arn", "source", "columns", "hidden", "notes"}; columns outside `referenced` are left out
+    entirely (not listed as hidden either)."""
     if (dataset.get("RowLevelPermissionDataSet") or {}).get("Status", "ENABLED") == "ENABLED" and \
             dataset.get("RowLevelPermissionDataSet"):
         raise Unsupported("数据集启用了行级权限，直接查询数据源会绕过它")
@@ -36,8 +40,7 @@ def plan(dataset, caller_arns):
         source = {"table": (body.get("Schema"), body["Name"])}
         input_columns = {c["Name"]: c["Type"] for c in body.get("InputColumns", [])}
     elif kind == "CustomSql":
-        source = {"sql": body["SqlQuery"].strip().rstrip(";")}
-        input_columns = {c["Name"]: c["Type"] for c in body.get("Columns", [])}
+        raise Unsupported("自定义 SQL（Custom SQL）数据集不受支持，请改用基于表（RelationalTable）的数据集")
     else:
         raise Unsupported(f"物理表类型 {kind} 暂不支持（如 S3 文件）")
 
@@ -67,6 +70,11 @@ def plan(dataset, caller_arns):
                 raise Unsupported("数据集定义了过滤条件，直接查询数据源会绕过它")
             elif op not in IGNORED_TRANSFORMS:
                 raise Unsupported(f"数据集里有暂不支持的转换 {op}")
+    if referenced is not None:
+        if any(n not in referenced for n in names):
+            notes.append("只列出分析里用到的列")
+        names = {n: p for n, p in names.items() if n in referenced}
+        hidden = [n for n in hidden if n in referenced]
     output_types = {c["Name"]: c["Type"] for c in dataset.get("OutputColumns", [])}
     for rule in dataset.get("ColumnLevelPermissionRules") or []:
         if not set(rule.get("Principals", [])) & set(caller_arns):

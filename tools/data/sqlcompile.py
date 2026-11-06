@@ -1,18 +1,26 @@
 """Compile a structured aggregate query into one parameterized, read-only SELECT. Pure functions, no I/O.
 
-The model never writes SQL. It sends {metrics, dimensions, time, filters, order_by, limit}; every identifier must be a
-known dataset column (mapped to its physical expression), every aggregate and operator comes from a fixed list, and
-every value is a bound parameter.
+The model never writes SQL. It sends {metrics, dimensions, time, filters, order_by, limit}; unknown keys are refused,
+every identifier must be a known dataset column (mapped to its physical expression), every aggregate and operator
+comes from a fixed list, and every value is a bound parameter: a string of at most MAX_VALUE_LENGTH characters or a
+finite number (lists only for in / not_in / between; is_null / not_null take none). The relation is always one
+quoted table, never custom SQL.
 """
 
+import math
 import re
 
 AGGS = {"sum": "SUM({})", "avg": "AVG({})", "min": "MIN({})", "max": "MAX({})", "count": "COUNT({})",
         "count_distinct": "COUNT(DISTINCT {})"}
 GRAINS = ("hour", "day", "week", "month", "quarter", "year")
 OPS = ("eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte", "between", "contains", "is_null", "not_null")
+LIST_OPS, NULL_OPS = ("in", "not_in", "between"), ("is_null", "not_null")
 MAX_METRICS, MAX_DIMENSIONS, MAX_FILTERS, MAX_IN_VALUES, MAX_LIMIT = 10, 3, 12, 200, 500
+MAX_VALUE_LENGTH = 500
 DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SPEC_KEYS = {"metrics", "dimensions", "time", "filters", "order_by", "limit"}
+METRIC_KEYS, TIME_KEYS, ORDER_KEYS = {"column", "agg"}, {"column", "grain"}, {"name", "desc"}
+FILTER_KEYS = {"column", "op", "value", "values"}
 
 
 class QueryError(ValueError):
@@ -96,29 +104,72 @@ def _escape_like(value):
 INDEXED = re.compile(r"^values\s*\[\s*(\d)\s*\]$")
 
 
-def _list_value(flt):
+def _list_value(flt, listed):
     """The list operand of in / not_in / between. Some models garble the key name ("values[]", "values 范围内",
-    "values[0]" + "values[1]"); accept those rather than burning a model round trip on a retry."""
-    if flt.get("values") is not None:
-        return flt["values"]
-    garbled = {k.strip(): v for k, v in flt.items() if isinstance(k, str) and k.strip().startswith("values")}
-    lists = [v for v in garbled.values() if isinstance(v, list)]
-    if lists:
-        return lists[0]
-    indexed = sorted((int(m.group(1)), v) for k, v in garbled.items() if (m := INDEXED.match(k)))
-    if indexed and [i for i, _ in indexed] == list(range(len(indexed))):
+    "values[0]" + "values[1]"); accept those rather than burning a model round trip on a retry. `listed` is one
+    representation (_operand refuses mixed ones): one "values..." key, or only indexed keys values[0], values[1]..."""
+    if not listed:
+        return flt.get("value")
+    indexed = sorted((int(m.group(1)), flt[k]) for k in listed if (m := INDEXED.match(k.strip())))
+    if len(indexed) < len(listed):
+        return flt[listed[0]]
+    if [i for i, _ in indexed] == list(range(len(indexed))):  # contiguous from 0, no duplicates
         return [v for _, v in indexed]
-    return flt.get("value")
+    return None
+
+
+def _known_keys(obj, allowed, where):
+    """Refuse keys outside `allowed`; filters also keep the garbled "values..." names _list_value accepts."""
+    unknown = [str(k) for k in obj if k not in allowed
+               and not (allowed is FILTER_KEYS and isinstance(k, str) and k.strip().startswith("values"))]
+    if unknown:
+        raise QueryError(f"{where} 不支持的字段：{', '.join(unknown)[:200]}")
+
+
+def _scalar(value):
+    """A bound value: a string of at most MAX_VALUE_LENGTH characters or a finite number (not a bool)."""
+    if isinstance(value, str) and len(value) <= MAX_VALUE_LENGTH:
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    raise QueryError(f"过滤值只能是字符串（最多 {MAX_VALUE_LENGTH} 个字符）或有限的数字")
+
+
+def _operand(flt, op):
+    """The filter's operand in the shape its operator takes, and nothing else: none for is_null / not_null, a list for
+    in / not_in / between ("values", one garbled "values..." key, indexed values[0], values[1]..., or "value"), one
+    scalar "value" for the rest. An operand counts as given when its key is present, even with a null value."""
+    listed = [k for k in flt if isinstance(k, str) and k.strip().startswith("values")]
+    given = "value" in flt
+    if op in NULL_OPS:
+        if given or listed:
+            raise QueryError(f"{op} 不需要 value 或 values")
+        return None
+    if op in LIST_OPS:
+        if given and listed:
+            raise QueryError(f'{op} 只用 "values"，不要同时给 value')
+        if len(listed) > 1 and any(not INDEXED.match(k.strip()) for k in listed):  # two lists, or a list + indexed
+            raise QueryError(f'{op} 只能给一个列表 "values": [...]，不要重复或混用 values 键')
+        return _list_value(flt, listed)  # schema: "values" is the list form
+    if listed:
+        raise QueryError(f'{op} 需要单个 "value"；列表（values）只用于 in、not_in 和 between')
+    value = flt.get("value")
+    if value is None or isinstance(value, (list, dict)):
+        raise QueryError(f"{op} 需要单个值")
+    return _scalar(value)
 
 
 def compile_query(spec, columns, source, dialect):
     """Return (sql, params, output_columns).
 
     columns: {output column name: {"expr": physical column name, "type": QuickSight type}}
-    source:  {"table": (schema, name)} or {"sql": custom SQL}
+    source:  {"table": (schema, name)}
     """
     if not isinstance(spec, dict):
         raise QueryError("查询参数必须是对象")
+    _known_keys(spec, SPEC_KEYS, "查询")
+    if "table" not in (source or {}):
+        raise QueryError("只支持基于表（RelationalTable）的数据集")
     params, counter = {}, [0]
 
     def bind(value):
@@ -144,7 +195,7 @@ def compile_query(spec, columns, source, dialect):
         raise QueryError(f"filters 最多 {MAX_FILTERS} 个")
     try:
         limit = max(1, min(MAX_LIMIT, int(spec.get("limit") or 200)))
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, OverflowError) as error:
         raise QueryError("limit 必须是整数") from error
 
     select, group, out = [], [], []
@@ -152,6 +203,7 @@ def compile_query(spec, columns, source, dialect):
     if time:
         if not isinstance(time, dict) or time.get("grain") not in GRAINS:
             raise QueryError(f"time.grain 只能是 {', '.join(GRAINS)}")
+        _known_keys(time, TIME_KEYS, "time")
         expression, info = column(time.get("column"), "time ")
         if info["type"] not in ("DATETIME", "DATE"):
             raise QueryError(f"{time['column']} 不是日期时间列")
@@ -165,8 +217,9 @@ def compile_query(spec, columns, source, dialect):
         out.append({"name": name, "role": "dimension"})
     used = {}
     for metric in metrics:
-        if not isinstance(metric, dict) or metric.get("agg") not in AGGS:
+        if not isinstance(metric, dict) or not isinstance(metric.get("agg"), str) or metric["agg"] not in AGGS:
             raise QueryError(f"metrics[].agg 只能是 {', '.join(AGGS)}")
+        _known_keys(metric, METRIC_KEYS, "metrics[]")
         agg, name = metric["agg"], metric.get("column")
         if agg == "count" and name in (None, "", "*"):
             expression, label = "*", "count"
@@ -185,34 +238,30 @@ def compile_query(spec, columns, source, dialect):
     for flt in filters:
         if not isinstance(flt, dict) or flt.get("op") not in OPS:
             raise QueryError(f"filters[].op 只能是 {', '.join(OPS)}")
+        _known_keys(flt, FILTER_KEYS, "filters[]")
         expression, info = column(flt.get("column"), "filters ")
-        op, value = flt["op"], flt.get("value")
-        if op in ("in", "not_in", "between"):
-            value = _list_value(flt)  # schema: "values" is the list form
-        elif isinstance(value, list) and len(value) == 1:
-            value = value[0]
+        op = flt["op"]
+        value = _operand(flt, op)
         is_time = info["type"] in ("DATETIME", "DATE")
-        if op in ("is_null", "not_null"):
+        if op in NULL_OPS:
             where.append(f"{expression} IS {'NOT ' if op == 'not_null' else ''}NULL")
             continue
         if op in ("in", "not_in"):
             if not isinstance(value, list) or not 1 <= len(value) <= MAX_IN_VALUES:
                 raise QueryError(f'{op} 需要 "values": [...]（键名正好是 values，1 到 {MAX_IN_VALUES} 个值）')
-            placeholders = ", ".join(bind(v) for v in value)
+            placeholders = ", ".join(bind(_scalar(v)) for v in value)
             where.append(f"{expression} {'NOT ' if op == 'not_in' else ''}IN ({placeholders})")
             continue
         if op == "between":
             if not isinstance(value, list) or len(value) != 2:
                 raise QueryError('between 需要 "values": ["最小值", "最大值"]（键名正好是 values，两个元素）；'
                                  '也可以改用一个 gte 加一个 lte 条件')
-            low, high = value
+            low, high = _scalar(value[0]), _scalar(value[1])
             if is_time and isinstance(high, str) and DATE_ONLY.match(high):
                 where.append(f"{expression} >= {bind(low)} AND {expression} < {dialect.next_day(bind(high))}")
             else:
                 where.append(f"{expression} BETWEEN {bind(low)} AND {bind(high)}")
             continue
-        if isinstance(value, (list, dict)) or value is None:
-            raise QueryError(f"{op} 需要单个值")
         if op == "contains":
             where.append(dialect.contains(expression, bind("%" + _escape_like(str(value)) + "%")))
             continue
@@ -223,16 +272,14 @@ def compile_query(spec, columns, source, dialect):
         symbol = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[op]
         where.append(f"{expression} {symbol} {bind(value)}")
 
-    if "table" in source:
-        schema, name = source["table"]
-        relation = (dialect.quote(schema) + "." if schema else "") + dialect.quote(name)
-    else:
-        relation = f"({source['sql']}) AS {dialect.quote('__src')}"
+    schema, name = source["table"]
+    relation = (dialect.quote(schema) + "." if schema else "") + dialect.quote(name)
 
     order = []
     for item in spec.get("order_by") or []:
         if not isinstance(item, dict):
             raise QueryError("order_by 每项需要 {name, desc}")
+        _known_keys(item, ORDER_KEYS, "order_by[]")
         names = [o["name"] for o in out]
         if item.get("name") not in names:
             raise QueryError(f"order_by 只能用输出列：{', '.join(names)}")
@@ -240,7 +287,8 @@ def compile_query(spec, columns, source, dialect):
     if not order:
         order = [str(i + 1) for i, o in enumerate(out) if o["role"] != "metric"] or ["1"]
 
-    sql = f"SELECT {', '.join(select)} FROM {relation}"
+    # Only quoted known identifiers and fixed SQL fragments are formatted in; every value is a bound parameter.
+    sql = f"SELECT {', '.join(select)} FROM {relation}"  # nosec B608
     if where:
         sql += " WHERE " + " AND ".join(where)
     if group:

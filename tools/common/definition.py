@@ -42,6 +42,38 @@ def dataset_ids(definition):
     return {d["Identifier"]: d["DataSetArn"].rsplit("/", 1)[-1] for d in definition.get("DataSetIdentifierDeclarations", [])}
 
 
+COLUMN_REFERENCE = re.compile(r"(?<!\$)\{([^{}]+)\}")  # {column} in a calculated field; ${parameter} is not one
+# QuickSight string literals take single or double quotes; an unterminated one runs to the end (read as text).
+STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.?)*(?:'|$)|\"(?:[^\"\\]|\\.?)*(?:\"|$)", re.S)
+
+
+def referenced_columns(definition):
+    """{dataset id: set of column names} the analysis uses: every {DataSetIdentifier, ColumnName} object anywhere in
+    the definition (field wells, filters, controls, sorts, ...) plus the columns its calculated fields read outside
+    string literals (a metric-switch preview queries those). The data tool offers only these columns."""
+    ids = dataset_ids(definition)
+    out = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            identifier, column = node.get("DataSetIdentifier"), node.get("ColumnName")
+            if isinstance(identifier, str) and isinstance(column, str) and identifier in ids:
+                out.setdefault(ids[identifier], set()).add(column)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(definition)
+    for field in definition.get("CalculatedFields", []):
+        expression = field.get("Expression") or ""
+        if field.get("DataSetIdentifier") in ids and isinstance(expression, str):
+            code = STRING_LITERAL.sub("''", expression)  # brace text inside a literal ('{salary}') is not a reference
+            names = set(COLUMN_REFERENCE.findall(code)) | {c for _p, _l, c in SWITCH_BRANCH.findall(code)}
+            out.setdefault(ids[field["DataSetIdentifier"]], set()).update(n.strip() for n in names)
+    return out
+
+
 def calculated_fields(definition):
     return {(c.get("DataSetIdentifier"), c["Name"]): c.get("Expression", "") for c in definition.get("CalculatedFields", [])}
 
@@ -284,6 +316,8 @@ def preview_query(definition, visual_id, parameter_values):
             op = role["op"]
             if op == "in" and not isinstance(value, list):
                 value = [value]
+            elif op != "in" and isinstance(value, list) and len(value) == 1:
+                value = value[0]  # a single-valued control; the data tool takes lists only for in / not_in / between
             query["filters"].append({"column": binding["column"], "op": op, "value": value})
     if any(f["dataset"] != dataset for f in fields):
         notes.append("部分字段口径无法确认")

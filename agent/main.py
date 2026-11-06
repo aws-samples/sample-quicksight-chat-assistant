@@ -707,4 +707,5 @@ def invoke(payload, context=None):
 
 if __name__ == "__main__":
     log(event="start", region=REGION, gateway=GATEWAY_URL)
-    app.run(host="0.0.0.0", port=8080)  # the SDK only binds 0.0.0.0 by itself inside Docker
+    # AgentCore Runtime contract: the container serves 0.0.0.0:8080 (the SDK only binds 0.0.0.0 by itself in Docker).
+    app.run(host="0.0.0.0", port=8080)  # nosec B104  # nosemgrep: python.flask.security.audit.app-run-param-config.avoid_app_run_with_bad_host

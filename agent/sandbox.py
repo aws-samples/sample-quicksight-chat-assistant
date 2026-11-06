@@ -104,6 +104,6 @@ class Sandbox:
             try:
                 self.client.stop_code_interpreter_session(codeInterpreterIdentifier=CODE_INTERPRETER_ID,
                                                           sessionId=self.session_id)
-            except Exception:  # noqa: BLE001 - the session also times out by itself
-                pass
+            except Exception as error:  # noqa: BLE001 - the session also times out by itself
+                print(json.dumps({"event": "code_interpreter_stop_failed", "error": repr(error)[:200]}))
             self.session_id = None

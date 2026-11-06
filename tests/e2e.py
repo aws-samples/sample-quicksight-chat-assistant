@@ -20,6 +20,7 @@ import json
 import pathlib
 import sys
 import time
+import urllib.parse
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -48,9 +49,9 @@ class Client:
     def token(self, email):
         """A browser session token (what the page holds after sign-in)."""
         return qsca.mint_token(self.session, self.out["SessionSecretName"], email)
-    def tool_token(self, email, analysis):
+    def tool_token(self, email, analysis, key_output="ToolSecretName"):
         """A tool token (what the web Lambda gives the Runtime or a button call), for invoking tool Lambdas directly."""
-        return qsca.mint_token(self.session, self.out["SessionSecretName"], email, analysis=analysis)
+        return qsca.mint_token(self.session, self.out[key_output], email, analysis=analysis)
     def invoke_tool(self, function_output, payload):
         response = self.session.client("lambda").invoke(FunctionName=self.out[function_output],
                                                         Payload=json.dumps(payload).encode())
@@ -100,6 +101,13 @@ class Client:
         return None
 
 
+def _https(url):
+    """The URL, if it is https:// (the deployment's API); anything else stops the test run."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise SystemExit(f"refusing to open a non-https URL: {url!r}")
+    return url
+
+
 def tools(result):
     return [(s["tool"], s["ok"]) for s in result.get("steps", [])]
 
@@ -115,6 +123,9 @@ def test_auth(c, args):
     describe = {"__tool": "describe_analysis", "_analysis": c.analysis}
     result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.token(args.editor)})
     check("session token refused by the tool Lambda", result.get("error") == "用户身份校验失败", result.get("error"))
+    forged = c.tool_token(args.editor, c.analysis, key_output="SessionSecretName")
+    result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": forged})
+    check("tool token signed with the session key refused", result.get("error") == "用户身份校验失败", result.get("error"))
     result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.tool_token(args.editor, "some-other-analysis")})
     check("tool token for another analysis refused", "不是为这个分析签发的" in str(result.get("error")), result.get("error"))
     result = c.invoke_tool("AnalysisToolsFunction", {**describe, "_caller": c.tool_token(args.editor, c.analysis)})
@@ -126,14 +137,17 @@ def test_auth(c, args):
     check("sign-out revokes the session token (200, 200 -> 401)", (before, out, after) == (200, 200, 401), (before, out, after))
     import re
     import urllib.request
-    with urllib.request.urlopen(f"{c.base}/", timeout=30, context=qsca.tls_context()) as response:
+    # _https() refuses anything but an https:// URL (no file:// or custom schemes).
+    with urllib.request.urlopen(_https(f"{c.base}/"), timeout=30, context=qsca.tls_context()) as response:  # nosec B310
         csp, page = response.headers.get("Content-Security-Policy", ""), response.read().decode("utf-8")
     script = re.search(r'<script src="(/static/app-[0-9a-f]{16}\.js)"', page)
     inline = [s for s in re.findall(r"<script([^>]*)>", page) if "src=" not in s and 'type="application/json"' not in s]
     check("page CSP: scripts only from this origin", "script-src 'self';" in csp and "default-src 'none'" in csp, csp)
     check("page has no inline script and loads app.js", script is not None and not inline, (bool(script), inline))
     if script:
-        with urllib.request.urlopen(c.base + script.group(1), timeout=30, context=qsca.tls_context()) as response:
+        # _https() refuses anything but an https:// URL (no file:// or custom schemes).
+        with urllib.request.urlopen(_https(c.base + script.group(1)), timeout=30,  # nosec B310
+                                    context=qsca.tls_context()) as response:
             check("app.js served", response.status == 200 and b"startSession" in response.read(), response.status)
     request = urllib.request.Request(f"{c.base}/auth/login?nonce={uuid.uuid4().hex}", method="GET")
 

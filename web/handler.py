@@ -1,11 +1,12 @@
 """API Gateway HTTP API Lambda for the chat panel embedded in QuickSight.
 
 Routes:
-  GET  /                       chat page (index.html; its script is /static/app-<hash>.js, no inline script)
-  GET  /static/<file>          app.js and the vendored ECharts / marked / DOMPurify, versioned names, cached for a year
+  GET  /                       chat page (index.html; its scripts are /static/render-<hash>.js and app-<hash>.js)
+  GET  /static/<file>          render.js, app.js and the vendored ECharts / marked / DOMPurify, versioned names,
+                               cached for a year
   GET  /auth/login             start IAM Identity Center SAML login (popup)
   POST /saml/acs               SAML assertion consumer; hands a session token (1 hour by default) to the iframe
-  POST /auth/logout            sign out: revoke this session token
+  POST /auth/logout            sign out: revoke this session token and cancel its running answers
   GET  /me                     who is signed in
   POST /chat                   submit a question: stored as a job, sent to the Runtime, which acknowledges at once
   GET  /jobs/{id}              job status, progress and result (STALLED when heartbeats stop)
@@ -53,6 +54,7 @@ STALE_SECONDS = 150  # the Runtime heartbeats every 30 s
 # tool access after the browser's 1-hour session token expires; a button click's lasts 5 minutes.
 JOB_TOKEN_SECONDS = int(os.environ.get("JOB_TOKEN_SECONDS", "28800"))
 BUTTON_TOKEN_SECONDS = 300
+SESSION_JOBS_MAX = 50  # chat jobs remembered per sign-in, cancelled on sign-out if still running
 # Third-party browser scripts vendored under web/vendor (see vendor/README.md); the page needs no CDN.
 STATIC_FILES = ("echarts-6.1.0.min.js", "marked-18.1.1.umd.js", "purify-3.4.17.min.js")
 
@@ -68,14 +70,22 @@ STATIC = {}
 for _name in STATIC_FILES:
     with open(os.path.join(HERE, "vendor", _name), encoding="utf-8") as script:
         STATIC[f"/static/{_name}"] = script.read()
-# The page's own script, under a content-hashed name so the year-long cache never serves an old version.
-with open(os.path.join(HERE, "app.js"), encoding="utf-8") as script:
-    _app = script.read()
-APP_JS = f"app-{hashlib.sha256(_app.encode('utf-8')).hexdigest()[:16]}.js"
-STATIC[f"/static/{APP_JS}"] = _app
+
+
+def _versioned(filename):
+    """The page's own scripts, under content-hashed names so the year-long cache never serves an old version."""
+    with open(os.path.join(HERE, filename), encoding="utf-8") as script:
+        body = script.read()
+    name = filename[:-3] + "-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] + ".js"
+    STATIC[f"/static/{name}"] = body
+    return name
+
+
+RENDER_JS = _versioned("render.js")  # safe DOM / Markdown rendering, loaded before app.js
+APP_JS = _versioned("app.js")
 with open(os.path.join(HERE, "index.html"), encoding="utf-8") as page:
     # Example questions travel as a JSON data block (not executed, so the CSP needs no inline script).
-    INDEX_HTML = page.read().replace("__APP_JS__", APP_JS).replace(
+    INDEX_HTML = page.read().replace("__RENDER_JS__", RENDER_JS).replace("__APP_JS__", APP_JS).replace(
         "__EXAMPLES__", json.dumps(json.loads(EXAMPLES_JSON), ensure_ascii=True).replace("<", "\\u003c"))
 STATIC_HEADERS = {"Content-Type": "application/javascript; charset=utf-8",
                   "Cache-Control": "public, max-age=31536000, immutable",
@@ -93,8 +103,8 @@ def popup_headers(nonce=None):
     """The login popup runs at most one inline script, allowed by a per-response nonce."""
     script = f"'nonce-{nonce}'" if nonce else "'none'"
     return {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8",
-            "Content-Security-Policy": f"default-src 'none'; script-src {script}; style-src 'unsafe-inline'; "
-                                       "base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'"}
+            "Content-Security-Policy": (f"default-src 'none'; script-src {script}; style-src 'unsafe-inline'; "
+                                        + "base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'")}
 
 
 def _uref(sub):
@@ -195,16 +205,38 @@ def login_finish(event):
     return popup(200, "登录成功", "正在返回聊天窗口…", message, origin(event))
 
 
+def _session_jobs_key(user):
+    return {"jobId": f"sessjobs#{user['jti']}"}
+
+
+def _remember_job(user, job_id):
+    """Record a chat job under this sign-in (the newest SESSION_JOBS_MAX), so sign-out can cancel it."""
+    item = jobs.get_item(Key=_session_jobs_key(user), ConsistentRead=True).get("Item") or {}
+    ids = [*(item.get("jobIds") or []), job_id][-SESSION_JOBS_MAX:]
+    jobs.put_item(Item={**_session_jobs_key(user), "jobIds": ids, "createdAt": int(time.time()),
+                        "expiresAt": int(user["exp"]) + 120})  # sign-out needs the session token, which expires
+
+
 def logout(user):
-    """The 退出 button: this session token stops working at once (other browsers' sessions are not affected)."""
-    auth.revoke_session(jobs, user)
-    print(json.dumps({"auth": "logout", "user": _uref(user["sub"])}))
-    return respond(200, {"ok": True})
+    """The 退出 button: this session token stops working at once (other browsers' sessions are not affected), its
+    answers still running are cancelled, and the analysis tools refuse its tool tokens (caller.revocation_check)."""
+    auth.revoke_session(jobs, user, JOB_TOKEN_SECONDS)  # job tool tokens outlive the session token
+    cancelled = 0
+    item = jobs.get_item(Key=_session_jobs_key(user), ConsistentRead=True).get("Item") or {}
+    for job_id in item.get("jobIds") or []:
+        try:
+            if cancel(str(job_id), user)["statusCode"] == 200:  # 404 / 409: gone or already finished
+                cancelled += 1
+        except Exception as error:  # noqa: BLE001 - one job must not fail the sign-out
+            print(json.dumps({"job": str(job_id), "logoutCancel": repr(error)[:300]}))
+    print(json.dumps({"auth": "logout", "user": _uref(user["sub"]), "cancelled": cancelled}))
+    return respond(200, {"ok": True, "cancelled": cancelled})
 
 
 def tool_token(user, analysis):
-    """A 5-minute tool token for one button click, bound to this user and analysis ("" for the analysis picker)."""
-    return auth.mint_tool_token(user["sub"], analysis, BUTTON_TOKEN_SECONDS)
+    """A 5-minute tool token for one button click, bound to this user, analysis ("" for the analysis picker) and
+    sign-in (sid)."""
+    return auth.mint_tool_token(user["sub"], analysis, BUTTON_TOKEN_SECONDS, sid=user["jti"])
 
 
 def submit(event, user):
@@ -240,10 +272,11 @@ def submit(event, user):
         f"{user['sub']}|{analysis}|{session_id}|{RUNTIME_VERSION}".encode()).hexdigest()[:48]
     job_id = uuid.uuid4().hex
     now = int(time.time())
-    jobs.put_item(Item={"jobId": job_id, "status": "RUNNING", "owner": user["sub"], "createdAt": now, "heartbeatAt": now,
-                        "runtimeSession": runtime_session, "expiresAt": now + JOB_TTL_SECONDS})
-    # "auth" is a tool token for this job, not the browser's session token: bound to this user and analysis, valid
-    # for the Runtime session's maximum lifetime. The Runtime never shows it to the model and only attaches it to this
+    jobs.put_item(Item={"jobId": job_id, "status": "RUNNING", "owner": user["sub"], "sid": user["jti"], "createdAt": now,
+                        "heartbeatAt": now, "runtimeSession": runtime_session, "expiresAt": now + JOB_TTL_SECONDS})
+    _remember_job(user, job_id)
+    # "auth" is a tool token for this job, not the browser's session token: bound to this user, analysis and sign-in
+    # (sid, so the analysis tools refuse it after sign-out), valid for the Runtime session's maximum lifetime. The Runtime never shows it to the model and only attaches it to this
     # solution's own tools, which verify it and check the user's QuickSight permissions.
     # "where": the page the chat is embedded in. The browser does not reveal the QuickSight page, so dashboards
     # published with `qsca publish` carry where=dashboard in the chat URL; anything else counts as the analysis.
@@ -251,7 +284,7 @@ def submit(event, user):
     payload = {"job": {"jobId": job_id}, "prompt": prompt, "history": body.get("history") or [],
                "analysis": analysis, "parameters": body.get("parameters") or {}, "where": where,
                "user": {"sub": user["sub"], "name": user.get("name")},
-               "auth": auth.mint_tool_token(user["sub"], analysis, JOB_TOKEN_SECONDS, jti=job_id)}
+               "auth": auth.mint_tool_token(user["sub"], analysis, JOB_TOKEN_SECONDS, sid=user["jti"], jti=job_id)}
     try:
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=RUNTIME_ARN, runtimeSessionId=runtime_session, contentType="application/json",

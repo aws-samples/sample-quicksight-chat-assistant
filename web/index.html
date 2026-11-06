@@ -125,6 +125,8 @@
 <!-- Vendored, versioned copies served by the web Lambda (web/vendor/README.md); no CDN. -->
 <script src="/static/marked-18.1.1.umd.js"></script>
 <script src="/static/purify-3.4.17.min.js"></script>
+<!-- The page's safe DOM / Markdown rendering (web/render.js), used by app.js. -->
+<script src="/static/__RENDER_JS__"></script>
 <!-- Example questions (config.json "examples"), filled in by the web Lambda; a data block, never executed. -->
 <script type="application/json" id="examples-data">__EXAMPLES__</script>
 <script src="/static/__APP_JS__"></script>

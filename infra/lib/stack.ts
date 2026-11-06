@@ -25,8 +25,15 @@ const LLM_PLACEHOLDER = JSON.stringify({
   temperature: 0.2, timeout: 120,
 });
 
+/** A tool schema shipped in this repository (callers pass literal repo-relative paths). The resolved path must stay
+ * inside the repository root; the scanner cannot see that check, hence the nosemgrep markers below. */
 function toolSchema(file: string): agentcore.CfnGatewayTarget.ToolDefinitionProperty[] {
-  return JSON.parse(fs.readFileSync(path.join(ROOT, file), 'utf-8'));
+  const full = path.resolve(ROOT, file); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const relative = path.relative(ROOT, full);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`tool schema ${file} must be a file inside the repository`);
+  }
+  return JSON.parse(fs.readFileSync(full, 'utf-8')); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
 }
 
 function mcpCredentials(target: McpTargetConfig): agentcore.CfnGatewayTarget.CredentialProviderConfigurationProperty[] | undefined {
@@ -66,8 +73,14 @@ export class ChatAssistantStack extends Stack {
       encryption: s3.BucketEncryption.S3_MANAGED, blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, enforceSSL: true,
       versioned: true, removalPolicy: RemovalPolicy.RETAIN, // analysis definitions saved before each change
     });
+    // Two signing keys: browser session tokens (read only by the web Lambda) and tool tokens (the web Lambda signs,
+    // the tool Lambdas verify), so a tool Lambda cannot mint a browser session.
     const sessionKey = new secrets.Secret(this, 'SessionKey', {
-      secretName: `${prefix}/session-key`, description: 'Signs chat session tokens (any random string).',
+      secretName: `${prefix}/session-key`, description: 'Signs browser session tokens; web Lambda only (any random string).',
+      generateSecretString: { passwordLength: 64, excludePunctuation: true },
+    });
+    const toolKey = new secrets.Secret(this, 'ToolKey', {
+      secretName: `${prefix}/tool-key`, description: 'Signs tool tokens for the analysis/data tool Lambdas (any random string).',
       generateSecretString: { passwordLength: 64, excludePunctuation: true },
     });
     const llm = new secrets.Secret(this, 'ModelConfig', {
@@ -79,7 +92,7 @@ export class ChatAssistantStack extends Stack {
     // ---- Tool Lambdas (Python 3.12, arm64; built into build/ by ./qsca build) ----
     const common = {
       ACCOUNT_ID: this.account, QS_REGION: this.region, QS_NAMESPACE: config.quickSight.namespace,
-      SESSION_SECRET_ID: sessionKey.secretName, ALLOWED_ANALYSIS_IDS: config.quickSight.allowedAnalysisIds.join(','),
+      TOOL_SECRET_ID: toolKey.secretName, ALLOWED_ANALYSIS_IDS: config.quickSight.allowedAnalysisIds.join(','),
     };
     const quicksightRead = new iam.PolicyStatement({
       actions: ['quicksight:DescribeAnalysis', 'quicksight:DescribeAnalysisPermissions'],
@@ -118,7 +131,7 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:DescribeDataSet'], resources: [`${qs}:dataset/*`] }));
     // UpdateAnalysis requires PassDataSet on every dataset the definition references.
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:PassDataSet'], resources: [`${qs}:dataset/*`] }));
-    sessionKey.grantRead(analysisFn);
+    toolKey.grantRead(analysisFn);
     backups.grantReadWrite(analysisFn, 'analysis-backups/*');
     backups.grantDelete(analysisFn, 'analysis-backups/*');
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
@@ -127,6 +140,11 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'], resources: [jobs.tableArn],
       conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*', 'examples#*'] } },
+    }));
+    // Tool tokens of a signed-out browser session are refused: read-only access to the sign-out records.
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:GetItem'], resources: [jobs.tableArn],
+      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['revoked#*'] } },
     }));
 
     let vpcProps: Partial<lambda.FunctionProps> = {};
@@ -165,11 +183,12 @@ export class ChatAssistantStack extends Stack {
       resources: [`${qs}:dataset/*`, `${qs}:datasource/*`],
     }));
     dataFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['rds:DescribeDBInstances'], resources: ['*'] }));
-    sessionKey.grantRead(dataFn);
+    toolKey.grantRead(dataFn);
+    // Only the assistant's own database secrets (`qsca datasource-secret`); never QuickSight's data source secrets.
     dataFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
-      resources: [`arn:${partition}:secretsmanager:*:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`,
-        ...config.dataAccess.extraSecretArns],
+      // The prefix is a literal checked by loadConfig not to cover <prefix>/session-key, tool-key or model-config.
+      resources: [`arn:${partition}:secretsmanager:${this.region}:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`],
     }));
 
     // ---- AgentCore Gateway (MCP, IAM inbound) with this solution's tools and optional enterprise MCP servers ----
@@ -274,6 +293,7 @@ export class ChatAssistantStack extends Stack {
       environment: {
         RUNTIME_ARN: runtime.attrAgentRuntimeArn, RUNTIME_VERSION: runtime.attrAgentRuntimeVersion, JOBS_TABLE: jobs.tableName,
         ANALYSIS_TOOLS_FN: analysisFn.functionName, SESSION_SECRET_ID: sessionKey.secretName,
+        TOOL_SECRET_ID: toolKey.secretName,
         IDP_METADATA_PARAMETER: idpParameter, SAML_SP_ENTITY_ID: config.identityCenter.samlEntityId,
         FRAME_ANCESTORS: config.frameAncestors, EXAMPLES_JSON: JSON.stringify(config.examples ?? []),
         IDENTITY_STORE_ID: config.identityCenter.identityStoreId ?? '', IDENTITY_CENTER_REGION: identityRegion,
@@ -284,6 +304,7 @@ export class ChatAssistantStack extends Stack {
     });
     jobs.grantReadWriteData(webFn);
     sessionKey.grantRead(webFn);
+    toolKey.grantRead(webFn);
     analysisFn.grantInvoke(webFn);
     webFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:StopRuntimeSession'],
@@ -341,6 +362,7 @@ export class ChatAssistantStack extends Stack {
     new CfnOutput(this, 'IdpMetadataParameter', { value: idpParameter, description: 'SSM parameter for the Identity Center metadata XML' });
     new CfnOutput(this, 'ModelSecretName', { value: llm.secretName, description: 'Edit this secret to configure the model' });
     new CfnOutput(this, 'SessionSecretName', { value: sessionKey.secretName });
+    new CfnOutput(this, 'ToolSecretName', { value: toolKey.secretName });
     new CfnOutput(this, 'RuntimeArn', { value: runtime.attrAgentRuntimeArn });
     new CfnOutput(this, 'GatewayId', { value: gateway.attrGatewayIdentifier });
     new CfnOutput(this, 'AnalysisToolsFunction', { value: analysisFn.functionName });

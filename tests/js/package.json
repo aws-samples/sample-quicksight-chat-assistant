@@ -1,0 +1,12 @@
+{
+  "name": "quicksight-chat-assistant-js-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Dev-only tests of the chat page's safe rendering (web/render.js); node:test + jsdom, no bundler.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "31.0.0"
+  }
+}

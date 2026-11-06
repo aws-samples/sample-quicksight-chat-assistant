@@ -2,8 +2,12 @@
 
 The Identity Center application metadata (XML) is read from the SSM parameter IDP_METADATA_PARAMETER on first use,
 so it can be set after deployment (`./qsca idp-metadata <file>`) without redeploying. Tokens are JWTs signed with
-HS256 by PyJWT (tools/common/tokens.py, shared with the tool Lambdas); the key is derived from the Secrets Manager
-secret SESSION_SECRET_ID.
+HS256 by PyJWT (tools/common/tokens.py, shared with the tool Lambdas). Two keys: session tokens are signed with the
+Secrets Manager secret SESSION_SECRET_ID, which only this Lambda can read; tool tokens with TOOL_SECRET_ID, which the
+tool Lambdas read to verify them (so a tool Lambda cannot mint a browser session).
+
+All XML parsing goes through _parse_xml: a parser that resolves no entities, loads no DTD and fetches nothing, and
+any document with a DOCTYPE is refused. The AuthnRequest is built with lxml element APIs, never by string formatting.
 
 Flow: the chat iframe opens a popup at /auth/login?nonce=..., which redirects to Identity Center with an
 AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the popup hands a
@@ -24,7 +28,8 @@ import zlib
 
 import boto3
 from botocore.config import Config
-from lxml import etree
+# SignXML requires lxml; every parse in this module goes through _parse_xml (hardened parser, DOCTYPE refused).
+from lxml import etree  # nosec B410
 from signxml import XMLVerifier
 from signxml.exceptions import SignXMLException
 
@@ -38,11 +43,14 @@ NS = {
 }
 SP_ENTITY_ID = os.environ["SAML_SP_ENTITY_ID"]
 SESSION_SECRET_ID = os.environ["SESSION_SECRET_ID"]
+TOOL_SECRET_ID = os.environ["TOOL_SECRET_ID"]
 IDP_METADATA_PARAMETER = os.environ["IDP_METADATA_PARAMETER"]
 SESSION_SECONDS = int(os.environ.get("SESSION_SECONDS", "3600"))
 LOGIN_SECONDS = 600
 CLOCK_SKEW = dt.timedelta(minutes=3)
-SAFE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False, remove_comments=True)
+SAFE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False, dtd_validation=False,
+                              huge_tree=False, remove_comments=True, remove_pis=True)
+DOCTYPE = re.compile(rb"<!DOCTYPE", re.I)
 
 
 class AuthError(Exception):
@@ -53,8 +61,27 @@ class NotConfigured(Exception):
     """Identity Center metadata has not been stored yet."""
 
 
+class UnsafeXml(Exception):
+    """The document declares a DOCTYPE (DTDs, entities); SAML and metadata never need one."""
+
+
+def _parse_xml(data):
+    """Parse untrusted XML bytes with SAFE_PARSER; any DOCTYPE is refused before and after parsing."""
+    if DOCTYPE.search(data):
+        raise UnsafeXml("DOCTYPE not allowed")
+    # Hardened parser: no entity resolution, no DTD loading, no network, no huge trees; DOCTYPE refused above.
+    root = etree.fromstring(data, SAFE_PARSER)  # nosec B320
+    info = root.getroottree().docinfo
+    if info.doctype or info.internalDTD is not None:  # e.g. a DOCTYPE in UTF-16, which the byte check cannot see
+        raise UnsafeXml("DOCTYPE not allowed")
+    return root
+
+
 def parse_idp_metadata(xml_bytes):
-    root = etree.fromstring(xml_bytes, SAFE_PARSER)
+    try:
+        root = _parse_xml(xml_bytes)
+    except UnsafeXml as error:
+        raise RuntimeError("Identity Center metadata must not contain a DOCTYPE") from error
     entity_id = root.get("entityID")
     redirect = root.xpath(
         "//md:IDPSSODescriptor/md:SingleSignOnService[@Binding='urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect']/@Location",
@@ -88,14 +115,25 @@ def idp():
 
 
 _session_key = None
+_tool_signing_key = None
 
 
 def _key():
+    """The session-token key (SESSION_SECRET_ID): browser sessions only, readable by this Lambda alone."""
     global _session_key
     if _session_key is None:
         raw = boto3.client("secretsmanager").get_secret_value(SecretId=SESSION_SECRET_ID)["SecretString"]
         _session_key = tokens.signing_key(raw)
     return _session_key
+
+
+def _tool_key():
+    """The tool-token key (TOOL_SECRET_ID), shared with the tool Lambdas that verify tool tokens."""
+    global _tool_signing_key
+    if _tool_signing_key is None:
+        raw = boto3.client("secretsmanager").get_secret_value(SecretId=TOOL_SECRET_ID)["SecretString"]
+        _tool_signing_key = tokens.signing_key(raw)
+    return _tool_signing_key
 
 
 def _revoked_key(jti):
@@ -119,15 +157,32 @@ def verify_session(token, table):
     return claims
 
 
-def revoke_session(table, claims):
-    """Sign-out: the session token stops working at once; the record expires (TTL) when the token would have."""
-    table.put_item(Item={**_revoked_key(claims["jti"]), "createdAt": int(time.time()),
-                         "expiresAt": int(claims["exp"]) + tokens.LEEWAY_SECONDS + 60})
+def revoke_session(table, claims, tool_token_seconds=0):
+    """Sign-out: the session token stops working at once. The record expires (TTL) only after the session token and
+    every tool token issued under it (at most `tool_token_seconds` from now) would have, so the analysis tools keep
+    refusing those tool tokens (`revoked#<sid>`) for their whole life."""
+    now = int(time.time())
+    until = max(int(claims["exp"]), now + int(tool_token_seconds))
+    table.put_item(Item={**_revoked_key(claims["jti"]), "createdAt": now,
+                         "expiresAt": until + tokens.LEEWAY_SECONDS + 60})
 
 
-def mint_tool_token(subject, analysis, seconds, jti=None):
-    """A token for the analysis/data tool Lambdas, bound to this user and analysis ("" for the analysis picker)."""
-    return tokens.mint(_key(), tokens.TOOLS_AUDIENCE, subject, seconds, jti=jti, analysis=analysis or "")[0]
+def mint_tool_token(subject, analysis, seconds, sid, jti=None):
+    """A token for the analysis/data tool Lambdas, bound to this user and analysis ("" for the analysis picker) and
+    to the browser session `sid` (its jti) it was issued under, so sign-out can stop it (tools/common/caller.py)."""
+    return tokens.mint(_tool_key(), tokens.TOOLS_AUDIENCE, subject, seconds, jti=jti, analysis=analysis or "",
+                       sid=sid)[0]
+
+
+def _authn_request(request_id, instant, sso_url, acs_url):
+    """The SAML AuthnRequest XML, built with element APIs (attribute values are escaped by lxml)."""
+    request = etree.Element(etree.QName(NS["samlp"], "AuthnRequest"), nsmap={"samlp": NS["samlp"], "saml": NS["saml"]})
+    for name, value in (("ID", request_id), ("Version", "2.0"), ("IssueInstant", instant), ("Destination", sso_url),
+                        ("AssertionConsumerServiceURL", acs_url),
+                        ("ProtocolBinding", "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST")):
+        request.set(name, value)
+    etree.SubElement(request, etree.QName(NS["saml"], "Issuer")).text = SP_ENTITY_ID
+    return etree.tostring(request)
 
 
 def login_redirect(table, nonce, acs_url):
@@ -137,16 +192,11 @@ def login_redirect(table, nonce, acs_url):
     now = int(time.time())
     table.put_item(Item={"jobId": f"saml#{request_id}", "nonce": nonce, "createdAt": now, "expiresAt": now + LOGIN_SECONDS})
     instant = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    request = (
-        f'<samlp:AuthnRequest xmlns:samlp="{NS["samlp"]}" xmlns:saml="{NS["saml"]}" ID="{request_id}" Version="2.0" '
-        f'IssueInstant="{instant}" Destination="{sso_url}" AssertionConsumerServiceURL="{acs_url}" '
-        f'ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST">'
-        f"<saml:Issuer>{SP_ENTITY_ID}</saml:Issuer></samlp:AuthnRequest>"
-    )
     deflater = zlib.compressobj(9, zlib.DEFLATED, -15)
-    encoded = base64.b64encode(deflater.compress(request.encode("utf-8")) + deflater.flush()).decode("ascii")
+    request = _authn_request(request_id, instant, sso_url, acs_url)
+    encoded = base64.b64encode(deflater.compress(request) + deflater.flush()).decode("ascii")
     separator = "&" if "?" in sso_url else "?"
-    return f"{sso_url}{separator}{urllib.parse.urlencode({'SAMLRequest': encoded, 'RelayState': request_id})}"
+    return sso_url + separator + urllib.parse.urlencode({"SAMLRequest": encoded, "RelayState": request_id})
 
 
 def _time(value, name):
@@ -177,7 +227,10 @@ def _verify_with_idp_certs(xml):
 
 
 def _verify_signature(response_xml):
-    root = etree.fromstring(response_xml, SAFE_PARSER)
+    try:
+        root = _parse_xml(response_xml)
+    except UnsafeXml as error:
+        raise AuthError("SAMLResponse must not contain a DOCTYPE") from error
     if root.tag != f"{{{NS['samlp']}}}Response":
         raise AuthError("not a SAML Response")
     assertions = root.findall("saml:Assertion", NS)

@@ -15,8 +15,7 @@
       "securityGroupIds": [],
       "createInterfaceEndpoints": true
     },
-    "datasourceSecretPrefix": "quicksight-chat-assistant/datasource/",
-    "extraSecretArns": []
+    "datasourceSecretPrefix": "REPLACE_ME/datasource/"
   },
   "mcpTargets": [],
   "runtime": {

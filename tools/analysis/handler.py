@@ -35,6 +35,15 @@ s3 = boto3.client("s3")
 jobs = boto3.resource("dynamodb").Table(os.environ["JOBS_TABLE"])
 
 
+def _session_revoked(sid):
+    """Sign-out stores revoked#<session jti> (web/auth.py revoke_session); a tool token carries that jti as sid, so a
+    running answer and its buttons stop editing as soon as the user signs out. The IAM role may read only these keys."""
+    return bool(jobs.get_item(Key={"jobId": f"revoked#{sid}"}, ConsistentRead=True).get("Item"))
+
+
+caller.revocation_check = _session_revoked
+
+
 def _prefix(aid):
     return f"analysis-backups/{aid}/"
 
@@ -69,11 +78,8 @@ def _tag_saved_state(key, updated, definition):
 
 def _save(aid, name, definition):
     qs.update_analysis(AwsAccountId=caller.ACCOUNT, AnalysisId=aid, Name=name, Definition=definition)
-    for _ in range(30):
-        info = qs.describe_analysis(AwsAccountId=caller.ACCOUNT, AnalysisId=aid)["Analysis"]
-        if not info["Status"].endswith("_IN_PROGRESS"):
-            break
-        time.sleep(1)
+    info = publisher.wait_until(lambda: qs.describe_analysis(AwsAccountId=caller.ACCOUNT, AnalysisId=aid)["Analysis"],
+                                lambda i: not i["Status"].endswith("_IN_PROGRESS"), 30, 1)
     if info.get("Errors") or not info["Status"].endswith("SUCCESSFUL"):
         raise ToolError(f"QuickSight 更新失败：{info['Status']} {info.get('Errors')}")
     caller._cache.pop(f"def:{aid}", None)
@@ -103,8 +109,8 @@ def describe_analysis(args):
     summary = defs.strip_for_model(definition)
     columns = {ds: dict(list(cols.items())[:150]) for ds, cols in dataset_columns(definition).items()}
     return {"analysis_id": aid, "name": name, **summary, "columns": columns,
-            "note": "visual_id 用于 preview_analysis_change；datasets 的值是 dataset_id，用于 query_dataset；"
-                    "columns 按数据集标识列出可用于编辑图表的列和类型。"}
+            "note": ("visual_id 用于 preview_analysis_change；datasets 的值是 dataset_id，用于 query_dataset；"
+                     + "columns 按数据集标识列出可用于编辑图表的列和类型。")}
 
 
 EDIT_KEYS = ("operation", "visual_id", "chart_type", "title", "measures", "category", "color", "sort", "dataset", "sheet_id")

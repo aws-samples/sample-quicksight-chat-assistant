@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "tools", "analysis"))
@@ -64,12 +65,33 @@ class PublisherTest(unittest.TestCase):
 
 
 
+class WaitUntilTest(unittest.TestCase):
+    """The one polling helper: monotonic deadline, bounded sleeps, last value returned."""
+
+    def test_returns_early_and_stops_at_the_deadline(self):
+        clock, sleeps = [100.0], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        with mock.patch.object(publisher.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(publisher.time, "sleep", sleep):
+            states = iter(["CREATION_IN_PROGRESS", "CREATION_IN_PROGRESS", "CREATION_SUCCESSFUL"])
+            self.assertEqual(publisher.wait_until(lambda: next(states), lambda s: not s.endswith("_IN_PROGRESS"), 30, 1),
+                             "CREATION_SUCCESSFUL")
+            self.assertEqual(sleeps, [1, 1])
+            calls = []
+            last = publisher.wait_until(lambda: calls.append(1) or "UPDATE_IN_PROGRESS", lambda s: False, 10, 3)
+        self.assertEqual(last, "UPDATE_IN_PROGRESS")
+        self.assertEqual((len(calls), sum(sleeps[2:])), (5, 10))  # never sleeps past the deadline
+
+
 class BindTest(unittest.TestCase):
     """bind_chat's URL rule: the same as `qsca attach` (analysis id, viewer, every parameter as <<$name>>)."""
 
     def test_chat_url_matches_attach(self):
         sys.path.insert(0, os.path.join(ROOT, "tools", "common"))
-        for key, value in (("SESSION_SECRET_ID", "x"), ("BACKUP_BUCKET", "b"), ("JOBS_TABLE", "t")):
+        for key, value in (("TOOL_SECRET_ID", "y"), ("BACKUP_BUCKET", "b"), ("JOBS_TABLE", "t")):
             os.environ.setdefault(key, value)
         import handler  # noqa: PLC0415 - analysis tools; needs the env above
         url = handler.chat_url("https://chat.example.com/", "a1", ["pStation", "pViewer", "pStartDate"])
