@@ -108,7 +108,7 @@ cp config.example.json config.json
 | `dataAccess.vpc` | VPC for the data tools Lambda when the databases are in a VPC: `{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }` (`null` if they are public). Reusing the `vpcId` and subnets of the QuickSight VPC connection is the easiest choice |
 | `dataAccess.vpc.securityGroupIds` | Extra security groups for the Lambda (e.g. one the database already allows) |
 | `dataAccess.vpc.createInterfaceEndpoints` | `true` creates QuickSight and Secrets Manager interface endpoints (needed when the subnets have no NAT); `false` if the VPC already has them |
-| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets (default `quicksight-chat-assistant/datasource/`); a literal prefix used only for these secrets, which must not cover `<prefix>/session-key`, `tool-key` or `model-config` |
+| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets: replace the example's `REPLACE_ME/datasource/` with your own, e.g. `quicksight-chat-assistant/datasource/`; a literal prefix used only for these secrets, which must not cover `<prefix>/session-key`, `tool-key` or `model-config` |
 | `dataAccess.extraSecretArns` | Ignored (accepted so older config files still load): the data tools read only their own `<datasourceSecretPrefix><DataSourceId>` secrets, never QuickSight's |
 | `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job and how long a job's tool token lasts) |
@@ -525,7 +525,7 @@ cp config.example.json config.json
 | `dataAccess.vpc` | 数据库在 VPC 内时，数据工具 Lambda 使用的 VPC：`{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }`（数据库可公网访问时填 `null`）。最简单的做法是复用 QuickSight VPC 连接的 `vpcId` 和子网 |
 | `dataAccess.vpc.securityGroupIds` | 给 Lambda 额外加的安全组（如数据库已放行的某个组） |
 | `dataAccess.vpc.createInterfaceEndpoints` | `true` 创建 QuickSight 和 Secrets Manager 接口端点（子网没有 NAT 时需要）；VPC 已有时填 `false` |
-| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀（默认 `quicksight-chat-assistant/datasource/`）；只用于这些密钥的固定前缀，不能覆盖 `<prefix>/session-key`、`tool-key` 或 `model-config` |
+| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀：把示例里的 `REPLACE_ME/datasource/` 换成自己的前缀，例如 `quicksight-chat-assistant/datasource/`；只用于这些密钥的固定前缀，不能覆盖 `<prefix>/session-key`、`tool-key` 或 `model-config` |
 | `dataAccess.extraSecretArns` | 已忽略（保留只为兼容旧配置文件）：数据工具只读取自己的 `<datasourceSecretPrefix><DataSourceId>` 密钥，从不使用 QuickSight 的 |
 | `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]` |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长，以及任务的工具令牌的有效期） |

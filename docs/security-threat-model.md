@@ -80,8 +80,9 @@ compiles it into one SELECT:
   `gte`, `lt`, `lte` and `contains`; a list only for `in`/`not_in` (1–200 values) and `between` (2 values); nothing
   for `is_null`/`not_null`. Any other or extra operand is refused; a present `value` or `values…` key counts as an
   operand even when its value is null. A list operator takes exactly one list representation: `values`, one garbled
-  `values…` key, or only indexed keys `values[0]`, `values[1]`, … (contiguous from 0). Mixed or duplicate
-  representations are refused, never resolved by picking one. The limit is 1–500 rows.
+  `values…` key, only indexed keys `values[0]`, `values[1]`, … (contiguous from 0), or a list under `value`. Mixed or
+  duplicate representations are refused, never resolved by picking one, and every list element is checked and bound
+  on its own. The limit is 1–500 rows.
 - `tools/data/handler.py` `_execute` is the one place generated SQL is executed, with the parameters passed to the
   driver separately.
 - The relation is always one quoted `schema.table`. The connection runs a read-only transaction with a constant 20 s
@@ -180,12 +181,11 @@ stack's own API URL). They are recorded here and not changed.
 
 Disposition: **fixed** means the code changed to remove the risk. Where a scanner cannot see the mitigation, a narrow
 `nosec`/`nosemgrep` annotation remains at the new location, with the reason in the comment above it. **FP** (false
-positive) means the flagged code was not a risk; it is annotated the same way (row 1 cannot be, because JSON has no
-comments).
+positive) means the flagged code was not a risk; it is annotated the same way.
 
 | # | Rule | Original | Disposition | Justification | New location |
 |---|---|---|---|---|---|
-| 1 | Checkov CKV_SECRET_6 | config.example.json:18 | FP | `datasourceSecretPrefix` is a Secrets Manager name prefix, not a secret. The detector also flags other prefix values, and a placeholder such as `<…>` would make invalid secret names and IAM resources | config.example.json:18 |
+| 1 | Checkov CKV_SECRET_6 | config.example.json:18 | fixed | `datasourceSecretPrefix` is a Secrets Manager name prefix, not a secret. The example now carries the placeholder `REPLACE_ME/datasource/`, which `loadConfig` accepts and Checkov does not flag (realistic prefixes such as `qsca/datasource/` are still flagged) | config.example.json:18 |
 | 2 | Bandit B320 | tests/unit/test_auth.py:220 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:265 |
 | 3 | Bandit B310 | tests/e2e.py:136 | fixed | `_https()` refuses non-https URLs before `urlopen`; `nosec B310` | tests/e2e.py:149 |
 | 4 | Bandit B320 | web/auth.py:57 | fixed | Metadata parsed by `_parse_xml` (hardened parser, DOCTYPE refused); `nosec` at the single parse point | web/auth.py:73 |
