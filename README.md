@@ -362,7 +362,7 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 SPICE datasets: built-in queries read the current source data, which may be newer than the last SPICE refresh (the
 answer says so).
 
-Threat model, residual risks and the AppSec scan ledger: [docs/security-threat-model.md](docs/security-threat-model.md).
+Threat model and residual risks: [docs/security-threat-model.md](docs/security-threat-model.md).
 This sample still needs your own security review before you use it as authentication or authorization guidance.
 
 ## Cost
@@ -752,7 +752,7 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 
 SPICE 数据集：内置查询读取的是源数据的当前值，可能比上次 SPICE 刷新更新（回答里会说明）。
 
-威胁模型、残余风险和 AppSec 扫描台账：[docs/security-threat-model.md](docs/security-threat-model.md)。把本示例当作认证或授权的参考之前，
+威胁模型和残余风险：[docs/security-threat-model.md](docs/security-threat-model.md)。把本示例当作认证或授权的参考之前，
 仍需要你自己的安全评审。
 
 ## 成本

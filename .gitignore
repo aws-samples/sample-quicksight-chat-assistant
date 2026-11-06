@@ -8,3 +8,4 @@ infra/cdk.context.json
 __pycache__/
 *.pyc
 .DS_Store
+.agents/

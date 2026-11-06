@@ -1,11 +1,20 @@
 # Security threat model
 
 This document describes how the QuickSight chat assistant authenticates users, authorizes their actions, turns model
-output into SQL and HTML, and which risks remain. It ends with a ledger of every row of the AppSec Probe scan
-(export `main-20261028`, 58 rows) and what happened to it.
+output into SQL and HTML, and which risks remain.
 
-**Status.** This is an AWS sample. It still needs your own AppSec review before you use it as guidance for
+**Status.** This is an AWS sample. It still needs your own security review before you use it as guidance for
 authentication or authorization. Its controls are sized for a sample, and the residual risks below are real.
+
+## Why the sample has its own authentication
+
+The chat page runs in an iframe inside a QuickSight analysis and does not receive the QuickSight user's identity, so
+it signs the user in separately. The sample targets the AWS China Regions, where Amazon Cognito user pools are not
+available ([Amazon Cognito in the China Regions](https://docs.amazonaws.cn/en_us/aws/latest/userguide/cognito.html)).
+Without a managed user pool there is no managed token issuer to put in front of the API, so the sample uses IAM
+Identity Center as the SAML identity provider, validates the assertion in the web Lambda, and issues its own
+short-lived tokens. That makes `web/auth.py`, `tools/common/tokens.py` and `tools/common/caller.py` security-critical
+code that you maintain. If you deploy where a managed identity service is available, prefer it over this code.
 
 ## Components and trust boundaries
 
@@ -161,92 +170,3 @@ purpose.
   conditions; VPC mode or endpoint redesign; release manifests and rollback tooling; exhaustive browser-storage
   schemas; removing the QuickSight permission caches; new toolchains (uv, iam-policy-autopilot); API Gateway access
   logging; request-size schemas beyond the fixes above.
-
-## How the scan was re-run
-
-The Probe export's rules were reproduced with Bandit 1.7.9 (all 12 Bandit rows; Bandit 1.9.4 no longer has the lxml
-checks B320/B410), Semgrep 1.184.0 with `p/default` plus `r/javascript`, `r/typescript` and `r/python` (all 46 Semgrep
-rows; `p/default` alone reproduces 8 of them), and Checkov 3.4.3 `--framework secrets` (the one Checkov row). The
-scanners were installed in a virtual environment outside the repository and run on a `git archive` of the branch.
-
-Probe re-scan `06d9b752-1f8f-45e1-8c7c-4a82c2b1efe8` of `main` after the merge (2026-11-06) reported 0 ERROR,
-6 WARNING and 0 INFO, against 9 / 46 / 3 at the baseline. The six warnings were exactly the six lines that relied on
-an inline `nosemgrep` marker (ledger rows 22, 27, 32 and 43): Probe honors Bandit `nosec` but not `nosemgrep`.
-Those lines were then restructured so the rules no longer match, and the local Semgrep run uses `--disable-nosem`
-to behave the same way; it reports nothing outside `qsca`.
-
-## Findings outside the Probe input
-
-The Probe did not scan `qsca` (the admin CLI has no file extension). The wider Semgrep set reports, on unchanged
-lines of `qsca`: `dangerous-subprocess-use-audit` at lines 97 and 153 (`pip install` and `npx cdk deploy`, argument
-lists without a shell, run by the operator), `arbitrary-sleep` at 265, 340 and 432 (bounded CloudFormation/QuickSight
-polling loops in the CLI), and `dynamic-urllib-use-detected` at 129 and 413 (fixed `https://` RDS CA URLs, and the
-stack's own API URL). They are recorded here and not changed.
-
-## Ledger
-
-Disposition: **fixed** means the code changed to remove the risk. Where Bandit cannot see the mitigation, a narrow
-`nosec` annotation remains at the new location, with the reason in the comment above it. **FP** (false positive)
-means the flagged code was not a risk; it is annotated the same way. No Semgrep finding depends on a `nosemgrep`
-marker (Probe ignores them); the two that remain in the code are explanatory only.
-
-| # | Rule | Original | Disposition | Justification | New location |
-|---|---|---|---|---|---|
-| 1 | Checkov CKV_SECRET_6 | config.example.json:18 | fixed | `datasourceSecretPrefix` is a Secrets Manager name prefix, not a secret. The example now carries the placeholder `REPLACE_ME/datasource/`, which `parseConfig` accepts and Checkov does not flag (realistic prefixes such as `qsca/datasource/` are still flagged) | config.example.json:18 |
-| 2 | Bandit B320 | tests/unit/test_auth.py:220 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:265 |
-| 3 | Bandit B310 | tests/e2e.py:136 | fixed | `_https()` refuses non-https URLs before `urlopen`; `nosec B310` | tests/e2e.py:149 |
-| 4 | Bandit B320 | web/auth.py:57 | fixed | Metadata parsed by `_parse_xml` (hardened parser, DOCTYPE refused); `nosec` at the single parse point | web/auth.py:73 |
-| 5 | Bandit B320 | web/auth.py:180 | fixed | SAMLResponse parsed by `_parse_xml`; DOCTYPE/XXE/entity-expansion tests | web/auth.py:73 |
-| 6 | Bandit B110 | agent/sandbox.py:107 | fixed | Logs `code_interpreter_stop_failed` instead of `pass` | agent/sandbox.py:108 |
-| 7 | Bandit B410 | web/auth.py:27 | FP | SignXML requires lxml; every parse goes through `_parse_xml` | web/auth.py:32 |
-| 8 | Bandit B104 | agent/main.py:710 | fixed | The agent calls `app.run(port=8080)` and the SDK picks the host: 0.0.0.0 only when `DOCKER_CONTAINER` is set, which the stack sets on the AgentCore Runtime (its contract is port 8080 on all interfaces of the microVM); a local run binds 127.0.0.1 | agent/main.py:712; infra/lib/stack.ts:281 |
-| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:291; tools/data/handler.py:157 |
-| 10 | Bandit B410 | tests/unit/test_auth.py:146 | FP | Test fixture (SignXML needs lxml) | tests/unit/test_auth.py:171 |
-| 11 | Bandit B310 | tests/e2e.py:129 | fixed | `_https()` before `urlopen`; `nosec B310` | tests/e2e.py:141 |
-| 12 | Bandit B320 | tests/unit/test_auth.py:209 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:248 |
-| 13 | Semgrep html-in-template-string | web/app.js:537 | fixed | Typing indicator built with `el()` | web/app.js:502 |
-| 14 | Semgrep formatted-sql-query | tools/data/handler.py:110 | fixed | Constant `SET SESSION max_execution_time = 20000` | tools/data/handler.py:112 |
-| 15 | Semgrep html-in-template-string | web/app.js:434 | fixed | `chartsNodes()` | web/app.js:393 |
-| 16 | Semgrep html-in-template-string | web/app.js:359 | fixed | `controlsNode()` | web/app.js:315 |
-| 17 | Semgrep string-concat-in-list | web/handler.py:96 | fixed | Explicit `+` | web/handler.py:106 |
-| 18 | Semgrep jquery-insecure-method | web/app.js:96 | fixed | `addMessage()`; `$` renamed `byId`; `Node.append` of nodes | web/app.js:51 |
-| 19 | Semgrep insecure-document-method (ERROR) | web/app.js:566 | fixed | `pending.replaceChildren(answerNode(turn))` | web/app.js:531 |
-| 20 | Semgrep jquery-insecure-method | web/app.js:278 | fixed | `Node.append` of a button node; no longer reported | web/app.js:241 |
-| 21 | Semgrep insecure-innerhtml (ERROR) | web/app.js:95 | fixed | `addMessage()` builds with `el()` | web/app.js:49 |
-| 22 | Semgrep avoid_app_run_with_bad_host | agent/main.py:710 | fixed | As row 8: no host literal in the code | agent/main.py:712 |
-| 23 | Semgrep directly-returned-format-string | web/auth.py:149 | fixed | AuthnRequest built with lxml elements; redirect URL concatenated with an urlencoded query | web/auth.py:177, :199 |
-| 24 | Semgrep html-in-template-string | web/app.js:424 | fixed | `previewNode()` | web/app.js:375 |
-| 25 | Semgrep html-in-template-string | web/app.js:526 | fixed | `answerNode()` | web/app.js:490 |
-| 26 | Semgrep html-in-template-string | web/app.js:441 | fixed | `chartsNodes()` | web/app.js:393 |
-| 27 | Semgrep detect-non-literal-fs-filename | infra/lib/stack.ts:29 | fixed | The two tool schemas are read once from fixed repository paths; no function takes a path | infra/lib/stack.ts:30-33 |
-| 28 | Semgrep html-in-template-string | web/app.js:303 | fixed | `showGreeting()` with `el()` | web/app.js:263 |
-| 29 | Semgrep insecure-document-method (ERROR) | web/app.js:466 | fixed | `box.replaceWith(previewNode(...))` | web/app.js:432 |
-| 30 | Semgrep arbitrary-sleep (ERROR) | tools/analysis/publisher.py:54 | fixed | `wait_until()`: monotonic deadline, the same 120 s limit, one annotated sleep | tools/analysis/publisher.py:58, :65 |
-| 31 | Semgrep insecure-innerhtml (ERROR) | web/app.js:466 | fixed | As row 29 | web/app.js:432 |
-| 32 | Semgrep path-join-resolve-traversal | infra/lib/stack.ts:29 | fixed | As row 27 | infra/lib/stack.ts:30-33 |
-| 33 | Semgrep html-in-template-string | web/app.js:417 | fixed | `previewNode()` | web/app.js:375 |
-| 34 | Semgrep sqlalchemy-execute-raw-query (ERROR) | tools/data/handler.py:110 | fixed | Constant statement | tools/data/handler.py:112 |
-| 35 | Semgrep html-in-template-string | web/app.js:529 | fixed | `answerNode()` | web/app.js:490 |
-| 36 | Semgrep html-in-template-string | web/app.js:304 | fixed | `showGreeting()` | web/app.js:263 |
-| 37 | Semgrep html-in-template-string | web/app.js:434 | fixed | `chartsNodes()` | web/app.js:393 |
-| 38 | Semgrep html-in-template-string | web/app.js:439 | fixed | `chartsNodes()` | web/app.js:393 |
-| 39 | Semgrep html-in-template-string | web/app.js:310 | fixed | `showLogin()` with `el()` | web/app.js:270 |
-| 40 | Semgrep insecure-innerhtml (ERROR) | web/app.js:566 | fixed | As row 19 | web/app.js:531 |
-| 41 | Semgrep html-in-template-string | web/app.js:356 | fixed | `controlsNode()` | web/app.js:315 |
-| 42 | Semgrep html-in-template-string | web/app.js:595 | fixed | `replayHistory()` with `el()` | web/app.js:556 |
-| 43 | Semgrep detect-non-literal-fs-filename | infra/lib/config.ts:47 | fixed | `config.ts` only validates JSON text (`parseConfig`); the CDK entry point reads the operator-chosen config file and requires a regular `.json` file | infra/bin/app.ts:10-14; infra/lib/config.ts:51 |
-| 44 | Semgrep html-in-template-string | web/app.js:437 | fixed | `chartsNodes()` | web/app.js:393 |
-| 45 | Semgrep html-in-template-string | web/app.js:355 | fixed | `controlsNode()` | web/app.js:315 |
-| 46 | Semgrep html-in-template-string | web/app.js:433 | fixed | `chartsNodes()` | web/app.js:393 |
-| 47 | Semgrep html-in-template-string | web/app.js:415 | fixed | `previewNode()` | web/app.js:375 |
-| 48 | Semgrep html-in-template-string | web/app.js:414 | fixed | `previewNode()` | web/app.js:375 |
-| 49 | Semgrep insecure-document-method (ERROR) | web/app.js:95 | fixed | As row 21 | web/app.js:49 |
-| 50 | Semgrep html-in-template-string | web/app.js:435 | fixed | `chartsNodes()` | web/app.js:393 |
-| 51 | Semgrep pg8000-sqli | tools/data/handler.py:98 | fixed | Constant `SET statement_timeout = 20000` | tools/data/handler.py:100 |
-| 52 | Semgrep jquery-insecure-method | web/app.js:144 | fixed | `byId("who").append` of nodes | web/app.js:104 |
-| 53 | Semgrep arbitrary-sleep (ERROR) | tools/analysis/handler.py:76 | fixed | `publisher.wait_until(…, 30, 1)` keeps the 30 s limit | tools/analysis/handler.py:81 |
-| 54 | Semgrep html-in-template-string | web/app.js:418 | fixed | `previewNode()` | web/app.js:375 |
-| 55 | Semgrep html-in-template-string | web/app.js:429 | fixed | `previewNode()` | web/app.js:375 |
-| 56 | Semgrep string-concat-in-list | tools/analysis/handler.py:106 | fixed | Explicit `+` | tools/analysis/handler.py:112 |
-| 57 | Semgrep jquery-insecure-method | web/app.js:43 | fixed | `byId("ctx").append` of a node | web/app.js:45 |
-| 58 | Semgrep jquery-insecure-method | web/app.js:290 | fixed | `Node.append` of a button node | web/app.js:253 |
