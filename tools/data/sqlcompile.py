@@ -138,9 +138,10 @@ def _scalar(value):
 
 def _operand(flt, op):
     """The filter's operand in the shape its operator takes, and nothing else: none for is_null / not_null, a list for
-    in / not_in / between ("values", a garbled "values..." key, or "value"), one scalar "value" for the rest."""
-    listed = [k for k, v in flt.items() if v is not None and isinstance(k, str) and k.strip().startswith("values")]
-    given = flt.get("value") is not None
+    in / not_in / between ("values", a garbled "values..." key, or "value"), one scalar "value" for the rest.
+    An operand counts as given when its key is present, even with a null value."""
+    listed = [k for k in flt if isinstance(k, str) and k.strip().startswith("values")]
+    given = "value" in flt
     if op in NULL_OPS:
         if given or listed:
             raise QueryError(f"{op} 不需要 value 或 values")

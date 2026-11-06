@@ -78,7 +78,8 @@ compiles it into one SELECT:
 - Values are always bound parameters: strings of at most 500 characters or finite, non-boolean numbers. Each filter
   carries exactly the operand its operator takes (`sqlcompile._operand`): one scalar `value` for `eq`, `ne`, `gt`,
   `gte`, `lt`, `lte` and `contains`; a list only for `in`/`not_in` (1–200 values) and `between` (2 values); nothing
-  for `is_null`/`not_null`. Any other or extra operand is refused. The limit is 1–500 rows.
+  for `is_null`/`not_null`. Any other or extra operand is refused; a present `value` or `values…` key counts as an
+  operand even when its value is null. The limit is 1–500 rows.
 - `tools/data/handler.py` `_execute` is the one place generated SQL is executed, with the parameters passed to the
   driver separately.
 - The relation is always one quoted `schema.table`. The connection runs a read-only transaction with a constant 20 s
@@ -184,7 +185,7 @@ comments).
 | 6 | Bandit B110 | agent/sandbox.py:107 | fixed | Logs `code_interpreter_stop_failed` instead of `pass` | agent/sandbox.py:108 |
 | 7 | Bandit B410 | web/auth.py:27 | FP | SignXML requires lxml; every parse goes through `_parse_xml` | web/auth.py:32 |
 | 8 | Bandit B104 | agent/main.py:710 | FP | AgentCore Runtime contract: the container serves 0.0.0.0:8080 inside its microVM | agent/main.py:711 |
-| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:289; tools/data/handler.py:157 |
+| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:290; tools/data/handler.py:157 |
 | 10 | Bandit B410 | tests/unit/test_auth.py:146 | FP | Test fixture (SignXML needs lxml) | tests/unit/test_auth.py:171 |
 | 11 | Bandit B310 | tests/e2e.py:129 | fixed | `_https()` before `urlopen`; `nosec B310` | tests/e2e.py:141 |
 | 12 | Bandit B320 | tests/unit/test_auth.py:209 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:248 |

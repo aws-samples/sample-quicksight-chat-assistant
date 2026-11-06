@@ -113,13 +113,18 @@ class SqlCompileTest(unittest.TestCase):
             {"column": "note", "op": "is_null", "value": "x"},  # null operators take no operand
             {"column": "note", "op": "not_null", "values": ["x"]},
             {"column": "note", "op": "is_null", "values[]": []},
+            {"column": "note", "op": "is_null", "value": None},  # a present key is an operand, even when null
+            {"column": "note", "op": "not_null", "values": None},
+            {"column": "station", "op": "eq", "value": "A", "values": None},
+            {"column": "station", "op": "in", "values": ["A"], "value": None},
+            {"column": "station", "op": "in", "values": None},
             {"column": "station", "op": "in", "values": ["A"], "value": "B"},  # one operand per filter
         ]
         for flt in bad:
             with self.assertRaises(sc.QueryError, msg=flt):
                 sc.compile_query({"metrics": [metric], "filters": [flt]}, COLUMNS, TABLE, dialect)
         sql, params, _o, _l = sc.compile_query(
-            {"metrics": [metric], "filters": [{"column": "note", "op": "is_null", "value": None},
+            {"metrics": [metric], "filters": [{"column": "note", "op": "is_null"},
                                               {"column": "station", "op": "not_null"},
                                               {"column": "station", "op": "in", "value": ["A"]}]},
             COLUMNS, TABLE, dialect)
