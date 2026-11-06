@@ -119,6 +119,13 @@ class SqlCompileTest(unittest.TestCase):
             {"column": "station", "op": "in", "values": ["A"], "value": None},
             {"column": "station", "op": "in", "values": None},
             {"column": "station", "op": "in", "values": ["A"], "value": "B"},  # one operand per filter
+            {"column": "station", "op": "in", "values": ["A"], "values[]": [{"x": 1}]},  # one list representation
+            {"column": "station", "op": "in", "values": ["A"], "values 范围内": ["B"]},
+            {"column": "station", "op": "in", "values[]": ["A"], "values 范围内": ["B"]},
+            {"column": "station", "op": "in", "values": None, "values[]": ["A"]},
+            {"column": "station", "op": "in", "values[]": ["A"], "values[0]": "B"},
+            {"column": "price", "op": "between", "values": [1, 2], "values[0]": 3, "values[1]": 4},
+            {"column": "price", "op": "between", "values[0]": 1, " values[0]": 2},  # duplicate index
         ]
         for flt in bad:
             with self.assertRaises(sc.QueryError, msg=flt):
@@ -287,6 +294,17 @@ class DefinitionTest(unittest.TestCase):
         self.assertEqual(set(refs), {"d1"})
         # field wells, filters and controls, plus the real columns the metric-switch calculated field reads
         self.assertTrue({"station", "t", "price", "elec"} <= refs["d1"], refs)
+
+    def test_brace_text_in_a_string_literal_is_not_a_column_reference(self):
+        d = analysis_definition()
+        d["CalculatedFields"].append({"DataSetIdentifier": "trade", "Name": "label",
+                                      "Expression": "concat({station}, '{secret}', \"{secret} x\", 'it\\'s {secret}')"})
+        self.assertNotIn("secret", defs.referenced_columns(d)["d1"])
+        self.assertIn("station", defs.referenced_columns(d)["d1"])
+        d["CalculatedFields"].append({"DataSetIdentifier": "trade", "Name": "open", "Expression": "concat('{secret}"})
+        self.assertNotIn("secret", defs.referenced_columns(d)["d1"])  # an unterminated literal is still text
+        plan = ds.plan(dataset_body(), ["arn:user/a"], defs.referenced_columns(d)["d1"])
+        self.assertNotIn("secret", plan["columns"])
 
     def test_model_view(self):
         view = defs.strip_for_model(analysis_definition())

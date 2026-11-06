@@ -108,7 +108,7 @@ cp config.example.json config.json
 | `dataAccess.vpc` | VPC for the data tools Lambda when the databases are in a VPC: `{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }` (`null` if they are public). Reusing the `vpcId` and subnets of the QuickSight VPC connection is the easiest choice |
 | `dataAccess.vpc.securityGroupIds` | Extra security groups for the Lambda (e.g. one the database already allows) |
 | `dataAccess.vpc.createInterfaceEndpoints` | `true` creates QuickSight and Secrets Manager interface endpoints (needed when the subnets have no NAT); `false` if the VPC already has them |
-| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets (default `quicksight-chat-assistant/datasource/`) |
+| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets (default `quicksight-chat-assistant/datasource/`); a literal prefix used only for these secrets, which must not cover `<prefix>/session-key`, `tool-key` or `model-config` |
 | `dataAccess.extraSecretArns` | Ignored (accepted so older config files still load): the data tools read only their own `<datasourceSecretPrefix><DataSourceId>` secrets, never QuickSight's |
 | `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job and how long a job's tool token lasts) |
@@ -276,6 +276,9 @@ Migrating from a version before the security hardening (see [docs/security-threa
   Deploy when no answer is running (tokens issued before the update stop working; users just ask again).
 - Database credentials come only from `<datasourceSecretPrefix><DataSourceId>` (`./qsca datasource-secret`) with a
   SELECT-only user; the fallback to the QuickSight data source's own secret and `extraSecretArns` are gone.
+  `datasourceSecretPrefix` must be a literal prefix (no `*` or `?`) that does not cover `<prefix>/session-key`,
+  `<prefix>/tool-key` or `<prefix>/model-config` (deploy refuses it otherwise), and the secrets must be in the
+  stack's region.
 - Custom SQL datasets are refused by the built-in queries, and only columns the analysis references are offered.
 - The browser keeps the sign-in in sessionStorage: each browser tab signs in once; **退出** also cancels that
   sign-in's running answers, and the analysis tools refuse its tool tokens.
@@ -411,7 +414,7 @@ model call that runs longer than 20 s, `model_retry` the automatic retries).
 ```bash
 python3.12 -m venv ~/.venvs/qsca && ~/.venvs/qsca/bin/pip install signxml==5.2.0 lxml==6.1.3 cryptography==50.0.2 PyJWT==2.15.1 boto3==1.43.115
 ACCOUNT_ID=0 SESSION_SECRET_ID=x TOOL_SECRET_ID=y QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-north-1 ~/.venvs/qsca/bin/python -m unittest discover -s tests/unit
-(cd infra && npm ci && npx tsc --noEmit)
+(cd infra && npm ci && npx tsc --noEmit && npm test)   # npm test: config validation
 (cd tests/js && npm ci && npm test)   # chat page rendering in jsdom (dev only)
 ./qsca build
 ```
@@ -522,7 +525,7 @@ cp config.example.json config.json
 | `dataAccess.vpc` | 数据库在 VPC 内时，数据工具 Lambda 使用的 VPC：`{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }`（数据库可公网访问时填 `null`）。最简单的做法是复用 QuickSight VPC 连接的 `vpcId` 和子网 |
 | `dataAccess.vpc.securityGroupIds` | 给 Lambda 额外加的安全组（如数据库已放行的某个组） |
 | `dataAccess.vpc.createInterfaceEndpoints` | `true` 创建 QuickSight 和 Secrets Manager 接口端点（子网没有 NAT 时需要）；VPC 已有时填 `false` |
-| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀（默认 `quicksight-chat-assistant/datasource/`） |
+| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀（默认 `quicksight-chat-assistant/datasource/`）；只用于这些密钥的固定前缀，不能覆盖 `<prefix>/session-key`、`tool-key` 或 `model-config` |
 | `dataAccess.extraSecretArns` | 已忽略（保留只为兼容旧配置文件）：数据工具只读取自己的 `<datasourceSecretPrefix><DataSourceId>` 密钥，从不使用 QuickSight 的 |
 | `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]` |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长，以及任务的工具令牌的有效期） |
@@ -675,7 +678,8 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 - 栈会新建第二个密钥 `<prefix>/tool-key`；工具 Lambda 不再能读取 `<prefix>/session-key`。请在没有回答正在运行时部署（更新前签发的
   令牌会失效，用户重新提问即可）。
 - 数据库凭证只来自 `<datasourceSecretPrefix><DataSourceId>`（`./qsca datasource-secret`），并且必须是只能 SELECT 的用户；不再回退到
-  QuickSight 数据源自己的密钥，`extraSecretArns` 也不再生效。
+  QuickSight 数据源自己的密钥，`extraSecretArns` 也不再生效。`datasourceSecretPrefix` 必须是不含 `*` 或 `?` 的固定前缀，并且不能覆盖
+  `<prefix>/session-key`、`<prefix>/tool-key` 或 `<prefix>/model-config`（否则部署会拒绝），密钥也必须在栈所在的区域。
 - 内置查询拒绝自定义 SQL 数据集，并且只提供分析用到的列。
 - 浏览器把登录保存在 sessionStorage 里：每个浏览器标签页各登录一次；**退出** 还会取消这次登录正在运行的回答，分析工具也会拒绝它的工具令牌。
 
@@ -797,7 +801,7 @@ Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
 ```bash
 python3.12 -m venv ~/.venvs/qsca && ~/.venvs/qsca/bin/pip install signxml==5.2.0 lxml==6.1.3 cryptography==50.0.2 PyJWT==2.15.1 boto3==1.43.115
 ACCOUNT_ID=0 SESSION_SECRET_ID=x TOOL_SECRET_ID=y QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-north-1 ~/.venvs/qsca/bin/python -m unittest discover -s tests/unit
-(cd infra && npm ci && npx tsc --noEmit)
+(cd infra && npm ci && npx tsc --noEmit && npm test)   # npm test：配置校验
 (cd tests/js && npm ci && npm test)   # 在 jsdom 里测试聊天页的渲染（仅开发用）
 ./qsca build
 ```

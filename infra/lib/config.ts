@@ -46,6 +46,9 @@ export interface AppConfig {
   examples?: { group: string; tip?: string; questions: string[] }[];
 }
 
+/** Secrets the stack creates as `<prefix>/<name>` (stack.ts); the data Lambda's secret prefix must not cover them. */
+export const STACK_SECRETS = ['session-key', 'tool-key', 'model-config'];
+
 /** The operator's deployment config (`-c config=...` or config.json). It is the operator's own choice of file, so
  * it may live anywhere; it must be a regular .json file. The nosemgrep markers cover the operator-chosen path. */
 export function loadConfig(file: string): AppConfig {
@@ -59,6 +62,15 @@ export function loadConfig(file: string): AppConfig {
   if (!config.identityCenter?.samlEntityId) problems.push('identityCenter.samlEntityId is required');
   const vpc = config.dataAccess?.vpc;
   if (vpc && (!vpc.vpcId || !vpc.subnetIds?.length)) problems.push('dataAccess.vpc needs vpcId and subnetIds (or set it to null)');
+  // The data Lambda may read `<datasourceSecretPrefix>*`: a literal name prefix that cannot cover the stack's secrets.
+  const secretPrefix = config.dataAccess?.datasourceSecretPrefix;
+  const own = STACK_SECRETS.map((name) => `${config.prefix}/${name}`);
+  if (typeof secretPrefix !== 'string' || !/^[A-Za-z0-9/_+=.@-]{1,200}$/.test(secretPrefix)) {
+    problems.push('dataAccess.datasourceSecretPrefix: a nonempty secret name prefix (letters, digits, /_+=.@-; no * or ?)');
+  } else if (own.some((name) => name.startsWith(secretPrefix) || secretPrefix.startsWith(name))) {
+    problems.push(`dataAccess.datasourceSecretPrefix "${secretPrefix}" overlaps the stack's own secrets (${own.join(', ')}); ` +
+      'use a dedicated prefix such as quicksight-chat-assistant/datasource/');
+  }
   for (const target of config.mcpTargets ?? []) {
     if (!/^[A-Za-z0-9-]{1,40}$/.test(target.name) || ['analysis', 'data'].includes(target.name)) {
       problems.push(`mcpTargets.name "${target.name}": letters, digits, hyphens; "analysis" and "data" are reserved`);

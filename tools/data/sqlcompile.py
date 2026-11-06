@@ -104,19 +104,18 @@ def _escape_like(value):
 INDEXED = re.compile(r"^values\s*\[\s*(\d)\s*\]$")
 
 
-def _list_value(flt):
+def _list_value(flt, listed):
     """The list operand of in / not_in / between. Some models garble the key name ("values[]", "values 范围内",
-    "values[0]" + "values[1]"); accept those rather than burning a model round trip on a retry."""
-    if flt.get("values") is not None:
-        return flt["values"]
-    garbled = {k.strip(): v for k, v in flt.items() if isinstance(k, str) and k.strip().startswith("values")}
-    lists = [v for v in garbled.values() if isinstance(v, list)]
-    if lists:
-        return lists[0]
-    indexed = sorted((int(m.group(1)), v) for k, v in garbled.items() if (m := INDEXED.match(k)))
-    if indexed and [i for i, _ in indexed] == list(range(len(indexed))):
+    "values[0]" + "values[1]"); accept those rather than burning a model round trip on a retry. `listed` is one
+    representation (_operand refuses mixed ones): one "values..." key, or only indexed keys values[0], values[1]..."""
+    if not listed:
+        return flt.get("value")
+    indexed = sorted((int(m.group(1)), flt[k]) for k in listed if (m := INDEXED.match(k.strip())))
+    if len(indexed) < len(listed):
+        return flt[listed[0]]
+    if [i for i, _ in indexed] == list(range(len(indexed))):  # contiguous from 0, no duplicates
         return [v for _, v in indexed]
-    return flt.get("value")
+    return None
 
 
 def _known_keys(obj, allowed, where):
@@ -138,8 +137,8 @@ def _scalar(value):
 
 def _operand(flt, op):
     """The filter's operand in the shape its operator takes, and nothing else: none for is_null / not_null, a list for
-    in / not_in / between ("values", a garbled "values..." key, or "value"), one scalar "value" for the rest.
-    An operand counts as given when its key is present, even with a null value."""
+    in / not_in / between ("values", one garbled "values..." key, indexed values[0], values[1]..., or "value"), one
+    scalar "value" for the rest. An operand counts as given when its key is present, even with a null value."""
     listed = [k for k in flt if isinstance(k, str) and k.strip().startswith("values")]
     given = "value" in flt
     if op in NULL_OPS:
@@ -149,7 +148,9 @@ def _operand(flt, op):
     if op in LIST_OPS:
         if given and listed:
             raise QueryError(f'{op} 只用 "values"，不要同时给 value')
-        return _list_value(flt)  # schema: "values" is the list form
+        if len(listed) > 1 and any(not INDEXED.match(k.strip()) for k in listed):  # two lists, or a list + indexed
+            raise QueryError(f'{op} 只能给一个列表 "values": [...]，不要重复或混用 values 键')
+        return _list_value(flt, listed)  # schema: "values" is the list form
     if listed:
         raise QueryError(f'{op} 需要单个 "value"；列表（values）只用于 in、not_in 和 between')
     value = flt.get("value")

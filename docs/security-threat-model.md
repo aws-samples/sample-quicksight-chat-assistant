@@ -79,7 +79,9 @@ compiles it into one SELECT:
   carries exactly the operand its operator takes (`sqlcompile._operand`): one scalar `value` for `eq`, `ne`, `gt`,
   `gte`, `lt`, `lte` and `contains`; a list only for `in`/`not_in` (1–200 values) and `between` (2 values); nothing
   for `is_null`/`not_null`. Any other or extra operand is refused; a present `value` or `values…` key counts as an
-  operand even when its value is null. The limit is 1–500 rows.
+  operand even when its value is null. A list operator takes exactly one list representation: `values`, one garbled
+  `values…` key, or only indexed keys `values[0]`, `values[1]`, … (contiguous from 0). Mixed or duplicate
+  representations are refused, never resolved by picking one. The limit is 1–500 rows.
 - `tools/data/handler.py` `_execute` is the one place generated SQL is executed, with the parameters passed to the
   driver separately.
 - The relation is always one quoted `schema.table`. The connection runs a read-only transaction with a constant 20 s
@@ -88,7 +90,8 @@ compiles it into one SELECT:
 The referenced columns come from `definition.referenced_columns()`. It collects every `{DataSetIdentifier,
 ColumnName}` object anywhere in the analysis definition, maps identifiers to dataset IDs through
 `DataSetIdentifierDeclarations`, and adds the `{column}` references of calculated fields, so metric-switch previews keep
-working. `dataset.plan()` intersects that set with the dataset's projected columns and then applies column-level
+working. String literals (single or double quotes, an unterminated one to the end) are masked first, so brace text
+such as `'{salary}'` is not read as a column. `dataset.plan()` intersects that set with the dataset's projected columns and then applies column-level
 security. Unreferenced columns are not even named in `hidden_columns`.
 
 ## Custom SQL policy
@@ -100,7 +103,9 @@ security (including tag-based) are still refused, because querying the source di
 ## Database credentials
 
 The data Lambda reads only `<datasourceSecretPrefix><DataSourceId>`, created with `./qsca datasource-secret`. Its IAM
-policy covers that prefix only. The fallback to the QuickSight data source's own `SecretArn` and the
+policy covers that prefix in the stack's region only. `loadConfig` requires the prefix to be a nonempty literal
+secret name prefix (no `*` or `?`) that neither covers nor extends `<prefix>/session-key`, `<prefix>/tool-key` or
+`<prefix>/model-config` (`infra/test/config.test.ts`), so the data Lambda cannot read a signing key. The fallback to the QuickSight data source's own `SecretArn` and the
 `extraSecretArns` setting were removed. Operators must create a dedicated database user that can only SELECT the
 dataset tables (the README has PostgreSQL and MySQL examples). The read-only transaction in the application is defense
 in depth, not the control.
@@ -146,6 +151,9 @@ purpose.
 - The referenced-column rule follows the analysis definition. A column the author added to any visual, filter,
   control or calculated field is queryable at row level through aggregates, and a column referenced only through a
   bare name in a non-switch calculated field is not offered.
+- `datasourceSecretPrefix` is checked only against this stack's own secrets. Any other secret in the region whose
+  name starts with it (for example another deployment's) is readable by the data Lambda, so keep the prefix
+  dedicated to assistant database credentials.
 - The page CSP allows inline styles (ECharts tooltips). ECharts escapes series names by default.
 - Not built here (out of scope): an asynchronous mutation worker, finalizer, SQS/DLQ, EventBridge sweeps, GSIs and
   leases; KMS asymmetric tokens, key rotation and canaries; a separate auth-state table; DynamoDB attribute-level IAM
@@ -185,7 +193,7 @@ comments).
 | 6 | Bandit B110 | agent/sandbox.py:107 | fixed | Logs `code_interpreter_stop_failed` instead of `pass` | agent/sandbox.py:108 |
 | 7 | Bandit B410 | web/auth.py:27 | FP | SignXML requires lxml; every parse goes through `_parse_xml` | web/auth.py:32 |
 | 8 | Bandit B104 | agent/main.py:710 | FP | AgentCore Runtime contract: the container serves 0.0.0.0:8080 inside its microVM | agent/main.py:711 |
-| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:290; tools/data/handler.py:157 |
+| 9 | Bandit B608 | tools/data/sqlcompile.py:243 | FP | Only quoted known identifiers and fixed fragments are formatted in; every value is bound. The one execution point carries a `nosemgrep` with the same reason | tools/data/sqlcompile.py:291; tools/data/handler.py:157 |
 | 10 | Bandit B410 | tests/unit/test_auth.py:146 | FP | Test fixture (SignXML needs lxml) | tests/unit/test_auth.py:171 |
 | 11 | Bandit B310 | tests/e2e.py:129 | fixed | `_https()` before `urlopen`; `nosec B310` | tests/e2e.py:141 |
 | 12 | Bandit B320 | tests/unit/test_auth.py:209 | FP | Test fixture parses XML it just built | tests/unit/test_auth.py:248 |
@@ -219,7 +227,7 @@ comments).
 | 40 | Semgrep insecure-innerhtml (ERROR) | web/app.js:566 | fixed | As row 19 | web/app.js:531 |
 | 41 | Semgrep html-in-template-string | web/app.js:356 | fixed | `controlsNode()` | web/app.js:315 |
 | 42 | Semgrep html-in-template-string | web/app.js:595 | fixed | `replayHistory()` with `el()` | web/app.js:556 |
-| 43 | Semgrep detect-non-literal-fs-filename | infra/lib/config.ts:47 | fixed | Operator-chosen config path, resolved and required to be a regular `.json` file; `nosemgrep` | infra/lib/config.ts:52, :53, :55 |
+| 43 | Semgrep detect-non-literal-fs-filename | infra/lib/config.ts:47 | fixed | Operator-chosen config path, resolved and required to be a regular `.json` file; `nosemgrep` | infra/lib/config.ts:55, :56, :58 |
 | 44 | Semgrep html-in-template-string | web/app.js:437 | fixed | `chartsNodes()` | web/app.js:393 |
 | 45 | Semgrep html-in-template-string | web/app.js:355 | fixed | `controlsNode()` | web/app.js:315 |
 | 46 | Semgrep html-in-template-string | web/app.js:433 | fixed | `chartsNodes()` | web/app.js:393 |

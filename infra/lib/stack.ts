@@ -187,7 +187,8 @@ export class ChatAssistantStack extends Stack {
     // Only the assistant's own database secrets (`qsca datasource-secret`); never QuickSight's data source secrets.
     dataFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
-      resources: [`arn:${partition}:secretsmanager:*:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`],
+      // The prefix is a literal checked by loadConfig not to cover <prefix>/session-key, tool-key or model-config.
+      resources: [`arn:${partition}:secretsmanager:${this.region}:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`],
     }));
 
     // ---- AgentCore Gateway (MCP, IAM inbound) with this solution's tools and optional enterprise MCP servers ----

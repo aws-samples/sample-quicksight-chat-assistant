@@ -43,12 +43,14 @@ def dataset_ids(definition):
 
 
 COLUMN_REFERENCE = re.compile(r"(?<!\$)\{([^{}]+)\}")  # {column} in a calculated field; ${parameter} is not one
+# QuickSight string literals take single or double quotes; an unterminated one runs to the end (read as text).
+STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.?)*(?:'|$)|\"(?:[^\"\\]|\\.?)*(?:\"|$)", re.S)
 
 
 def referenced_columns(definition):
     """{dataset id: set of column names} the analysis uses: every {DataSetIdentifier, ColumnName} object anywhere in
-    the definition (field wells, filters, controls, sorts, ...) plus the columns its calculated fields read (a
-    metric-switch preview queries those). The data tool offers only these columns."""
+    the definition (field wells, filters, controls, sorts, ...) plus the columns its calculated fields read outside
+    string literals (a metric-switch preview queries those). The data tool offers only these columns."""
     ids = dataset_ids(definition)
     out = {}
 
@@ -66,7 +68,8 @@ def referenced_columns(definition):
     for field in definition.get("CalculatedFields", []):
         expression = field.get("Expression") or ""
         if field.get("DataSetIdentifier") in ids and isinstance(expression, str):
-            names = set(COLUMN_REFERENCE.findall(expression)) | {c for _p, _l, c in SWITCH_BRANCH.findall(expression)}
+            code = STRING_LITERAL.sub("''", expression)  # brace text inside a literal ('{salary}') is not a reference
+            names = set(COLUMN_REFERENCE.findall(code)) | {c for _p, _l, c in SWITCH_BRANCH.findall(code)}
             out.setdefault(ids[field["DataSetIdentifier"]], set()).update(n.strip() for n in names)
     return out
 
