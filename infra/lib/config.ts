@@ -1,6 +1,3 @@
-import * as fs from 'fs';
-import * as path from 'path';
-
 /** One enterprise MCP server registered on the gateway (e.g. DataHub or Metabase behind MCPHub). */
 export interface McpTargetConfig {
   /** Target name; its tools appear to the agent as `<name>___<tool>`. Letters, digits and hyphens. */
@@ -49,13 +46,10 @@ export interface AppConfig {
 /** Secrets the stack creates as `<prefix>/<name>` (stack.ts); the data Lambda's secret prefix must not cover them. */
 export const STACK_SECRETS = ['session-key', 'tool-key', 'model-config'];
 
-/** The operator's deployment config (`-c config=...` or config.json). It is the operator's own choice of file, so
- * it may live anywhere; it must be a regular .json file. The nosemgrep markers cover the operator-chosen path. */
-export function loadConfig(file: string): AppConfig {
-  const resolved = path.resolve(file); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-  const stat = fs.statSync(resolved); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
-  if (path.extname(resolved) !== '.json' || !stat.isFile()) throw new Error(`config ${file}: must be a regular .json file`);
-  const config = JSON.parse(fs.readFileSync(resolved, 'utf-8')) as AppConfig; // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
+/** Validate the operator's deployment config, given as JSON text. `source` names it in error messages. Reading the
+ * file (the operator's own choice of `-c config=...` or config.json) is done by bin/app.ts, the CLI entry point. */
+export function parseConfig(text: string, source: string): AppConfig {
+  const config = JSON.parse(text) as AppConfig;
   const problems: string[] = [];
   if (!/^[a-z][a-z0-9]{1,11}$/.test(config.prefix)) problems.push('prefix: 2-12 lowercase letters/digits, starting with a letter');
   if (!config.region) problems.push('region is required');
@@ -83,6 +77,6 @@ export function loadConfig(file: string): AppConfig {
   }
   const examples = Buffer.byteLength(JSON.stringify(config.examples ?? []), 'utf8');
   if (examples > 2500) problems.push(`examples: ${examples} bytes as JSON; keep under 2500 (Lambda environment variables share a 4 KB limit)`);
-  if (problems.length) throw new Error(`config ${file}:\n  - ${problems.join('\n  - ')}`);
+  if (problems.length) throw new Error(`config ${source}:\n  - ${problems.join('\n  - ')}`);
   return config;
 }

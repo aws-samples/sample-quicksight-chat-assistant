@@ -25,16 +25,12 @@ const LLM_PLACEHOLDER = JSON.stringify({
   temperature: 0.2, timeout: 120,
 });
 
-/** A tool schema shipped in this repository (callers pass literal repo-relative paths). The resolved path must stay
- * inside the repository root; the scanner cannot see that check, hence the nosemgrep markers below. */
-function toolSchema(file: string): agentcore.CfnGatewayTarget.ToolDefinitionProperty[] {
-  const full = path.resolve(ROOT, file); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-  const relative = path.relative(ROOT, full);
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new Error(`tool schema ${file} must be a file inside the repository`);
-  }
-  return JSON.parse(fs.readFileSync(full, 'utf-8')); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename.detect-non-literal-fs-filename
-}
+type ToolSchema = agentcore.CfnGatewayTarget.ToolDefinitionProperty[];
+/** The Gateway tool schemas shipped in this repository, read from fixed paths. */
+const ANALYSIS_TOOL_SCHEMA: ToolSchema = JSON.parse(
+  fs.readFileSync(path.join(ROOT, 'tools', 'analysis', 'tool_schema.json'), 'utf-8'));
+const DATA_TOOL_SCHEMA: ToolSchema = JSON.parse(
+  fs.readFileSync(path.join(ROOT, 'tools', 'data', 'tool_schema.json'), 'utf-8'));
 
 function mcpCredentials(target: McpTargetConfig): agentcore.CfnGatewayTarget.CredentialProviderConfigurationProperty[] | undefined {
   const auth = target.auth;
@@ -187,7 +183,7 @@ export class ChatAssistantStack extends Stack {
     // Only the assistant's own database secrets (`qsca datasource-secret`); never QuickSight's data source secrets.
     dataFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
-      // The prefix is a literal checked by loadConfig not to cover <prefix>/session-key, tool-key or model-config.
+      // The prefix is a literal checked by parseConfig (config.ts) not to cover <prefix>/session-key, tool-key or model-config.
       resources: [`arn:${partition}:secretsmanager:${this.region}:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`],
     }));
 
@@ -202,16 +198,16 @@ export class ChatAssistantStack extends Stack {
       description: 'Tools for the QuickSight chat assistant',
     });
     gateway.node.addDependency(gatewayRole);
-    const lambdaTarget = (name: string, fn: lambda.Function, schema: string, description: string) => {
+    const lambdaTarget = (name: string, fn: lambda.Function, schema: ToolSchema, description: string) => {
       const target = new agentcore.CfnGatewayTarget(this, `Target-${name}`, {
         gatewayIdentifier: gateway.attrGatewayIdentifier, name, description,
-        targetConfiguration: { mcp: { lambda: { lambdaArn: fn.functionArn, toolSchema: { inlinePayload: toolSchema(schema) } } } },
+        targetConfiguration: { mcp: { lambda: { lambdaArn: fn.functionArn, toolSchema: { inlinePayload: schema } } } },
         credentialProviderConfigurations: [{ credentialProviderType: 'GATEWAY_IAM_ROLE' }],
       });
       target.node.addDependency(gatewayRole);
     };
-    lambdaTarget('analysis', analysisFn, 'tools/analysis/tool_schema.json', 'Describe and edit the embedding analysis');
-    lambdaTarget('data', dataFn, 'tools/data/tool_schema.json', 'Read-only queries on the analysis datasets');
+    lambdaTarget('analysis', analysisFn, ANALYSIS_TOOL_SCHEMA, 'Describe and edit the embedding analysis');
+    lambdaTarget('data', dataFn, DATA_TOOL_SCHEMA, 'Read-only queries on the analysis datasets');
     for (const target of config.mcpTargets ?? []) {
       if (target.auth.type === 'iam' && target.auth.runtimeArn) {
         gatewayRole.addToPolicy(new iam.PolicyStatement({
@@ -280,6 +276,9 @@ export class ChatAssistantStack extends Stack {
       environmentVariables: {
         GATEWAY_URL: gateway.attrGatewayUrl, LLM_SECRET_ID: llm.secretName, JOBS_TABLE: jobs.tableName, APP_REGION: this.region,
         CODE_INTERPRETER_ID: codeInterpreter.attrCodeInterpreterId,
+        // The AgentCore Runtime contract: the agent serves port 8080 on all interfaces of its microVM. The SDK's
+        // app.run() binds 0.0.0.0 only when it sees a container (this variable); elsewhere it binds 127.0.0.1.
+        DOCKER_CONTAINER: '1',
       },
     });
     runtime.node.addDependency(runtimeRole);
