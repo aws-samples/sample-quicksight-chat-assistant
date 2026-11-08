@@ -365,6 +365,22 @@ answer says so).
 Threat model and residual risks: [docs/security-threat-model.md](docs/security-threat-model.md).
 This sample still needs your own security review before you use it as authentication or authorization guidance.
 
+## Responsible AI
+
+The assistant uses a large language model to read questions and write answers. Treat its answers as a starting point
+for analysis, not as decisions.
+
+| Topic | How the sample handles it |
+|---|---|
+| Intended use | Exploring and editing QuickSight analyses the signed-in user can already view or edit. It is not designed to make decisions about people, such as hiring, credit or eligibility |
+| Accuracy | The model can misread a question, pick the wrong column or filter, or describe a result incorrectly. Numbers in charts and previews are read from tool results by code and never typed by the model, but the text around them comes from the model: check important answers against the analysis |
+| Transparency | Each answer lists the tools it called with their arguments, and shows the model name and the time taken. Answers say when data came directly from the source instead of the SPICE copy |
+| Human oversight | The model cannot change an analysis by itself. An edit is shown as a preview with the data it would display, and the analysis changes only when the requester presses **应用到分析**; the previous definition is backed up first, and the last change can be undone |
+| Untrusted content | Dataset values, analysis text and enterprise MCP results can contain instructions aimed at the model (prompt injection). The model never sets the user identity or the analysis and never writes SQL, its Markdown cannot load images or other remote content, and permissions are checked by the tools, not by the model |
+| Content filtering | The sample does not configure Amazon Bedrock Guardrails or another content filter: the model is any OpenAI-compatible endpoint, and Amazon Bedrock is not offered in the AWS China Regions. If your use requires content filtering, apply it at your model endpoint or gateway (for example Bedrock Guardrails when you use Amazon Bedrock in a supported Region) |
+| Bias | Answers reflect the data in the analysis and the behavior of the model you choose. The sample does not test models for bias; evaluate the model you configure with your own users and data |
+| Data sent to the model | Questions, the last turns of the conversation, the analysis structure and query results go to your model endpoint (see *Data flow* above); choose an endpoint whose data-use terms meet your requirements |
+
 ## Cost
 
 Usage-based: AgentCore Runtime (active session CPU/memory time), Gateway calls, Code Interpreter sessions, Lambda, API
@@ -754,6 +770,21 @@ SPICE 数据集：内置查询读取的是源数据的当前值，可能比上�
 
 威胁模型和残余风险：[docs/security-threat-model.md](docs/security-threat-model.md)。把本示例当作认证或授权的参考之前，
 仍需要你自己的安全评审。
+
+## 负责任的 AI
+
+助手用大语言模型理解提问、撰写回答。请把它的回答当作分析的起点，而不是决策。
+
+| 方面 | 本示例的做法 |
+|---|---|
+| 预期用途 | 探索和修改登录用户本来就能查看或编辑的 QuickSight 分析。不用于对人做决定，例如招聘、授信或资格审核 |
+| 准确性 | 模型可能理解错问题、选错列或筛选条件，也可能描述错结果。图表和预览里的数字由代码从工具结果中读取，从不由模型填写，但周围的文字来自模型：重要的回答请对照分析核实 |
+| 透明 | 每个回答都会列出调用过的工具及参数，并显示模型名称和耗时；数据直接取自数据源而不是 SPICE 副本时，回答会说明 |
+| 人工把关 | 模型不能自己修改分析。修改先以预览展示（附带修改后会显示的数据），只有发起人点 **应用到分析** 后分析才会改变；修改前会先备份原定义，最近一次修改可以撤销 |
+| 不可信内容 | 数据集里的值、分析里的文字和企业 MCP 返回的结果，都可能夹带针对模型的指令（提示注入）。模型从不设置用户身份或分析，也从不写 SQL；它输出的 Markdown 不能加载图片或其他远程内容；权限由工具检查，而不是由模型决定 |
+| 内容过滤 | 本示例没有配置 Amazon Bedrock Guardrails 或其他内容过滤：模型可以是任意 OpenAI 兼容端点，而 AWS 中国区没有 Amazon Bedrock。如果你的场景需要内容过滤，请在模型端点或网关上配置（例如在支持的区域使用 Amazon Bedrock 时启用 Bedrock Guardrails） |
+| 偏差 | 回答取决于分析里的数据和你所选模型的行为。本示例不对模型做偏差测试；请用你自己的用户和数据评估所配置的模型 |
+| 发送给模型的数据 | 提问、最近几轮对话、分析结构和查询结果会发送到你的模型端点（见上面的“数据流向”）；请选择数据使用条款符合你要求的端点 |
 
 ## 成本
 
