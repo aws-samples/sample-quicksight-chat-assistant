@@ -267,7 +267,7 @@ These servers never receive the user's identity: expose read-only tools only.
 - Update: pull the new code, `./qsca deploy`. The model secret, Identity Center metadata and credentials are kept.
 - Roll back: deploy the previous version of the code.
 - Uninstall: `cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`. Kept on purpose: the S3
-  backup bucket, SSM parameter `/<prefix>/idp-metadata`, data source secrets, the chat visual in analyses, the
+  backup bucket and its access-log bucket (logs expire after 365 days), SSM parameter `/<prefix>/idp-metadata`, data source secrets, the chat visual in analyses, the
   Identity Center application.
 
 Migrating from a version before the security hardening (see [docs/security-threat-model.md](docs/security-threat-model.md)):
@@ -670,7 +670,7 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 
 - 更新：拉取新代码后 `./qsca deploy`。模型密钥、Identity Center 元数据和凭证会保留。
 - 回滚：部署上一个版本的代码。
-- 卸载：`cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`。有意保留的资源：S3 备份桶、SSM 参数
+- 卸载：`cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`。有意保留的资源：S3 备份桶及其访问日志桶（日志 365 天后过期）、SSM 参数
   `/<prefix>/idp-metadata`、数据源密钥、分析里的聊天可视对象、Identity Center 应用。
 
 从安全加固之前的版本迁移（见 [docs/security-threat-model.md](docs/security-threat-model.md)）：

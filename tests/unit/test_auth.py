@@ -62,7 +62,9 @@ class TokensTest(unittest.TestCase):
         claims = jwt.decode(token, KEY, algorithms=["HS256"], audience=tokens.SESSION_AUDIENCE)
         claims["sub"] = "admin@example.com"
         swapped = jwt.encode(claims, other, algorithm="HS256").split(".")[1]
-        unsigned = jwt.encode(claims, None, algorithm="none")
+        def b64(part):
+            return base64.urlsafe_b64encode(json.dumps(part).encode()).rstrip(b"=").decode()
+        unsigned = f'{b64({"alg": "none", "typ": "JWT"})}.{b64(claims)}.'  # an "alg": "none" token must be refused
         for bad in (tokens.mint(other, tokens.SESSION_AUDIENCE, "a@example.com", 60)[0],  # another key
                     f"{header}.{swapped}.{signature}",  # body changed, signature kept
                     unsigned, f"{header}.{body}.", "x.y", "", "a" * 5000):

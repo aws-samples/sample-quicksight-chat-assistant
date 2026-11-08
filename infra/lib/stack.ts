@@ -65,9 +65,17 @@ export class ChatAssistantStack extends Stack {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST, timeToLiveAttribute: 'expiresAt',
       removalPolicy: RemovalPolicy.DESTROY, // chat jobs, login state and pending changes; all expire within a day
     });
+    // S3 server access logs of the backup bucket. SSE-S3 (log delivery cannot use a KMS key), no Object Lock, and
+    // delivery authorized by the bucket policy CDK adds for logging.s3 (cdk.json serverAccessLogsUseBucketPolicy).
+    const accessLogs = new s3.Bucket(this, 'AccessLogs', {
+      encryption: s3.BucketEncryption.S3_MANAGED, blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, enforceSSL: true,
+      versioned: true, removalPolicy: RemovalPolicy.RETAIN,
+      lifecycleRules: [{ expiration: Duration.days(365), noncurrentVersionExpiration: Duration.days(30) }],
+    });
     const backups = new s3.Bucket(this, 'Backups', {
       encryption: s3.BucketEncryption.S3_MANAGED, blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, enforceSSL: true,
       versioned: true, removalPolicy: RemovalPolicy.RETAIN, // analysis definitions saved before each change
+      serverAccessLogsBucket: accessLogs, serverAccessLogsPrefix: 'backups/',
     });
     // Two signing keys: browser session tokens (read only by the web Lambda) and tool tokens (the web Lambda signs,
     // the tool Lambdas verify), so a tool Lambda cannot mint a browser session.
@@ -368,5 +376,6 @@ export class ChatAssistantStack extends Stack {
     new CfnOutput(this, 'DataToolsFunction', { value: dataFn.functionName });
     new CfnOutput(this, 'JobsTable', { value: jobs.tableName });
     new CfnOutput(this, 'BackupBucket', { value: backups.bucketName });
+    new CfnOutput(this, 'AccessLogBucket', { value: accessLogs.bucketName, description: 'S3 server access logs of BackupBucket' });
   }
 }
