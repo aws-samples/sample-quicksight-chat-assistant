@@ -13,11 +13,16 @@
       "vpcId": "vpc-0123456789abcdef0",
       "subnetIds": ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"],
       "securityGroupIds": [],
-      "createInterfaceEndpoints": true
+      "createInterfaceEndpoints": true,
+      "databaseEgress": [
+        {"cidr": "10.0.0.0/16", "port": 5432},
+        {"cidr": "10.0.0.0/16", "port": 3306}
+      ]
     },
     "datasourceSecretPrefix": "REPLACE_ME/datasource/"
   },
   "mcpTargets": [],
+  "enterpriseReadOnlyTools": [],
   "runtime": {
     "idleSeconds": 300,
     "maxLifetimeSeconds": 28800
@@ -26,5 +31,5 @@
     "rateLimit": 5,
     "burstLimit": 10
   },
-  "frameAncestors": "https://*.quicksight.amazonaws.cn https://*.amazonaws.cn"
+  "frameAncestors": "https://cn-north-1.quicksight.amazonaws.cn"
 }

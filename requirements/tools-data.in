@@ -1,0 +1,6 @@
+# Direct dependencies for the data tools Lambda bundle.
+# scramp 1.4.18 retains make_channel_binding, which pg8000 1.31.5 requires.
+pg8000==1.31.5
+scramp==1.4.18
+PyMySQL==1.1.2
+PyJWT==2.15.1

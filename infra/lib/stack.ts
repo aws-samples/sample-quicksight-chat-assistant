@@ -50,6 +50,7 @@ export class ChatAssistantStack extends Stack {
   constructor(scope: Construct, id: string, config: AppConfig, props?: StackProps) {
     super(scope, id, props);
     const { prefix } = config;
+    const enterpriseReadOnlyTools = config.enterpriseReadOnlyTools ?? [];
     const partition = this.partition;
     const qs = `arn:${partition}:quicksight:${this.region}:${this.account}`;
     const analysisResources = config.quickSight.allowedAnalysisIds.includes('*')
@@ -58,6 +59,11 @@ export class ChatAssistantStack extends Stack {
     const logGroup = (id: string, fn: string) => new logs.LogGroup(this, id, {
       logGroupName: `/aws/lambda/${fn}`, retention: logs.RetentionDays.THREE_MONTHS, removalPolicy: RemovalPolicy.DESTROY,
     });
+    const leadingKeys = (patterns: string[]) => ({
+      'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': patterns },
+      Null: { 'dynamodb:LeadingKeys': 'false' },
+    });
+    const peer = (cidr: string) => cidr.includes(':') ? ec2.Peer.ipv6(cidr) : ec2.Peer.ipv4(cidr);
 
     // ---- Storage and secrets ----
     const jobs = new dynamodb.Table(this, 'Jobs', {
@@ -77,14 +83,18 @@ export class ChatAssistantStack extends Stack {
       versioned: true, removalPolicy: RemovalPolicy.RETAIN, // analysis definitions saved before each change
       serverAccessLogsBucket: accessLogs, serverAccessLogsPrefix: 'backups/',
     });
-    // Two signing keys: browser session tokens (read only by the web Lambda) and tool tokens (the web Lambda signs,
-    // the tool Lambdas verify), so a tool Lambda cannot mint a browser session.
+    // Separate keys for browser sessions, tool tokens and keyed log pseudonyms. Each execution role reads
+    // only the key it needs; every component may read the log key so one user has the same pseudonym across logs.
     const sessionKey = new secrets.Secret(this, 'SessionKey', {
       secretName: `${prefix}/session-key`, description: 'Signs browser session tokens; web Lambda only (any random string).',
       generateSecretString: { passwordLength: 64, excludePunctuation: true },
     });
     const toolKey = new secrets.Secret(this, 'ToolKey', {
       secretName: `${prefix}/tool-key`, description: 'Signs tool tokens for the analysis/data tool Lambdas (any random string).',
+      generateSecretString: { passwordLength: 64, excludePunctuation: true },
+    });
+    const logKey = new secrets.Secret(this, 'LogKey', {
+      secretName: `${prefix}/log-key`, description: 'HMAC key for privacy-preserving user references in operational logs.',
       generateSecretString: { passwordLength: 64, excludePunctuation: true },
     });
     const llm = new secrets.Secret(this, 'ModelConfig', {
@@ -96,7 +106,9 @@ export class ChatAssistantStack extends Stack {
     // ---- Tool Lambdas (Python 3.12, arm64; built into build/ by ./qsca build) ----
     const common = {
       ACCOUNT_ID: this.account, QS_REGION: this.region, QS_NAMESPACE: config.quickSight.namespace,
-      TOOL_SECRET_ID: toolKey.secretName, ALLOWED_ANALYSIS_IDS: config.quickSight.allowedAnalysisIds.join(','),
+      TOOL_SECRET_ID: toolKey.secretName, LOG_SECRET_ID: logKey.secretName,
+      ALLOWED_ANALYSIS_IDS: config.quickSight.allowedAnalysisIds.join(','),
+      JOBS_TABLE: jobs.tableName,
     };
     const quicksightRead = new iam.PolicyStatement({
       actions: ['quicksight:DescribeAnalysis', 'quicksight:DescribeAnalysisPermissions'],
@@ -107,8 +119,7 @@ export class ChatAssistantStack extends Stack {
       resources: [`${qs}:user/${config.quickSight.namespace}/*`],
     });
     const quicksightDashboards = new iam.PolicyStatement({
-      actions: ['quicksight:ListDashboards', 'quicksight:DescribeDashboard', 'quicksight:DescribeDashboardPermissions',
-        'quicksight:ListTagsForResource'],
+      actions: ['quicksight:ListDashboards', 'quicksight:DescribeDashboard', 'quicksight:DescribeDashboardPermissions'],
       resources: [`${qs}:dashboard/*`],
     });
 
@@ -136,38 +147,69 @@ export class ChatAssistantStack extends Stack {
     // UpdateAnalysis requires PassDataSet on every dataset the definition references.
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:PassDataSet'], resources: [`${qs}:dataset/*`] }));
     toolKey.grantRead(analysisFn);
+    logKey.grantRead(analysisFn);
     backups.grantReadWrite(analysisFn, 'analysis-backups/*');
     backups.grantDelete(analysisFn, 'analysis-backups/*');
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['s3:PutObjectTagging', 's3:GetObjectTagging'], resources: [backups.arnForObjects('analysis-backups/*')],
     }));
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'], resources: [jobs.tableArn],
-      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*', 'examples#*'] } },
+      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem'], resources: [jobs.tableArn],
+      conditions: leadingKeys(['pending#*']),
+    }));
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [jobs.tableArn],
+      conditions: leadingKeys(['examples#*']),
+    }));
+    // Trusted dashboard provenance: read during authorization, write/delete only after a validated publish.
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem', 'dynamodb:GetItem'], resources: [jobs.tableArn],
+      conditions: leadingKeys(['dashboard#*']),
     }));
     // Tool tokens of a signed-out browser session are refused: read-only access to the sign-out records.
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['dynamodb:GetItem'], resources: [jobs.tableArn],
-      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['revoked#*'] } },
+      actions: ['dynamodb:GetItem'], resources: [jobs.tableArn], conditions: leadingKeys(['revoked#*']),
     }));
 
     let vpcProps: Partial<lambda.FunctionProps> = {};
+    let dynamodbEndpointUrl: string | undefined;
+    let rdsEndpointUrl: string | undefined;
     const vpcConfig = config.dataAccess.vpc;
     if (vpcConfig) {
       const vpc = ec2.Vpc.fromLookup(this, 'DataVpc', { vpcId: vpcConfig.vpcId });
       const subnets = vpcConfig.subnetIds.map((id, i) => ec2.Subnet.fromSubnetId(this, `DataSubnet${i}`, id));
-      const own = new ec2.SecurityGroup(this, 'DataToolsSg', { vpc, description: `${prefix} data tools`, allowAllOutbound: true });
+      const own = new ec2.SecurityGroup(this, 'DataToolsSg', {
+        vpc, description: `${prefix} data tools (explicit endpoint and database egress only)`, allowAllOutbound: false,
+      });
       const groups = [own, ...vpcConfig.securityGroupIds.map((id, i) => ec2.SecurityGroup.fromSecurityGroupId(this, `DataSg${i}`, id))];
+      for (const destination of vpcConfig.databaseEgress) {
+        own.addEgressRule(peer(destination.cidr), ec2.Port.tcp(destination.port), 'configured database destination');
+      }
       if (vpcConfig.createInterfaceEndpoints) {
-        // The Lambda has no internet in these subnets: reach QuickSight and Secrets Manager privately.
+        // The Lambda has no internet in these subnets: every AWS API it calls has a private endpoint.
         const endpointSg = new ec2.SecurityGroup(this, 'EndpointSg', { vpc, description: `${prefix} interface endpoints` });
         endpointSg.addIngressRule(own, ec2.Port.tcp(443), 'data tools');
-        for (const [id, service] of [['QuickSightEndpoint', 'quicksight'], ['SecretsEndpoint', 'secretsmanager']]) {
-          new ec2.InterfaceVpcEndpoint(this, id, {
-            vpc, service: new ec2.InterfaceVpcEndpointService(`com.amazonaws.${this.region}.${service}`, 443),
-            subnets: { subnets }, securityGroups: [endpointSg], privateDnsEnabled: true,
-          });
+        own.addEgressRule(endpointSg, ec2.Port.tcp(443), 'owned AWS service endpoints');
+        const endpoint = (id: string, service: string, privateDnsEnabled: boolean) => new ec2.InterfaceVpcEndpoint(this, id, {
+          vpc, service: new ec2.InterfaceVpcEndpointService(`com.amazonaws.${this.region}.${service}`, 443),
+          subnets: { subnets }, securityGroups: [endpointSg], privateDnsEnabled,
+        });
+        endpoint('QuickSightEndpoint', 'quicksight', true);
+        endpoint('SecretsEndpoint', 'secretsmanager', true);
+        const dynamodbEndpoint = endpoint('DynamoDbEndpoint', 'dynamodb', false);
+        const rdsEndpoint = endpoint('RdsEndpoint', 'rds', false);
+        const endpointUrl = (value: string[]) =>
+          `https://${Fn.select(1, Fn.split(':', Fn.select(0, value)))}`;
+        // DynamoDB does not provide private DNS for interface endpoints. RDS China interface endpoints use a separate
+        // API hostname, so both SDK clients use the endpoint-specific regional DNS name generated by CloudFormation.
+        dynamodbEndpointUrl = endpointUrl(dynamodbEndpoint.vpcEndpointDnsEntries);
+        rdsEndpointUrl = endpointUrl(rdsEndpoint.vpcEndpointDnsEntries);
+      } else {
+        for (const cidr of vpcConfig.endpointHttpsCidrs ?? []) {
+          own.addEgressRule(peer(cidr), ec2.Port.tcp(443), 'configured AWS service endpoints');
         }
+        dynamodbEndpointUrl = vpcConfig.dynamodbEndpointUrl;
+        rdsEndpointUrl = vpcConfig.rdsEndpointUrl;
       }
       vpcProps = { vpc, vpcSubnets: { subnets }, securityGroups: groups, allowPublicSubnet: true };
     }
@@ -175,7 +217,11 @@ export class ChatAssistantStack extends Stack {
       functionName: `${prefix}-data-tools`, runtime: lambda.Runtime.PYTHON_3_12, architecture: lambda.Architecture.ARM_64,
       handler: 'handler.handler', code: lambda.Code.fromAsset(path.join(BUILD, 'tools-data')),
       timeout: Duration.seconds(60), memorySize: 512, logGroup: logGroup('DataToolsLogs', `${prefix}-data-tools`),
-      environment: { ...common, DATASOURCE_SECRET_PREFIX: config.dataAccess.datasourceSecretPrefix },
+      environment: {
+        ...common, DATASOURCE_SECRET_PREFIX: config.dataAccess.datasourceSecretPrefix,
+        ...(dynamodbEndpointUrl ? { DYNAMODB_ENDPOINT_URL: dynamodbEndpointUrl } : {}),
+        ...(rdsEndpointUrl ? { RDS_ENDPOINT_URL: rdsEndpointUrl } : {}),
+      },
       description: 'Read-only aggregate queries on the datasets of the analysis the chat is embedded in.',
       ...vpcProps,
     });
@@ -187,11 +233,15 @@ export class ChatAssistantStack extends Stack {
       resources: [`${qs}:dataset/*`, `${qs}:datasource/*`],
     }));
     dataFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['rds:DescribeDBInstances'], resources: ['*'] }));
+    dataFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:GetItem'], resources: [jobs.tableArn], conditions: leadingKeys(['dashboard#*']),
+    }));
     toolKey.grantRead(dataFn);
+    logKey.grantRead(dataFn);
     // Only the assistant's own database secrets (`qsca datasource-secret`); never QuickSight's data source secrets.
     dataFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
-      // The prefix is a literal checked by parseConfig (config.ts) not to cover <prefix>/session-key, tool-key or model-config.
+      // The literal prefix is validated not to cover the stack's session, tool, log or model secrets.
       resources: [`arn:${partition}:secretsmanager:${this.region}:${this.account}:secret:${config.dataAccess.datasourceSecretPrefix}*`],
     }));
 
@@ -243,8 +293,12 @@ export class ChatAssistantStack extends Stack {
     });
     agentCode.grantRead(runtimeRole);
     llm.grantRead(runtimeRole);
+    logKey.grantRead(runtimeRole);
     runtimeRole.addToPolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:InvokeGateway'], resources: [gateway.attrGatewayArn] }));
-    runtimeRole.addToPolicy(new iam.PolicyStatement({ actions: ['dynamodb:UpdateItem'], resources: [jobs.tableArn] }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:UpdateItem'], resources: [jobs.tableArn],
+      conditions: leadingKeys(['????????????????????????????????']),
+    }));
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:StartCodeInterpreterSession', 'bedrock-agentcore:InvokeCodeInterpreter',
         'bedrock-agentcore:StopCodeInterpreterSession', 'bedrock-agentcore:GetCodeInterpreterSession'],
@@ -282,8 +336,10 @@ export class ChatAssistantStack extends Stack {
       networkConfiguration: { networkMode: 'PUBLIC' },
       lifecycleConfiguration: { idleRuntimeSessionTimeout: config.runtime.idleSeconds, maxLifetime: config.runtime.maxLifetimeSeconds },
       environmentVariables: {
-        GATEWAY_URL: gateway.attrGatewayUrl, LLM_SECRET_ID: llm.secretName, JOBS_TABLE: jobs.tableName, APP_REGION: this.region,
+        GATEWAY_URL: gateway.attrGatewayUrl, LLM_SECRET_ID: llm.secretName, LOG_SECRET_ID: logKey.secretName,
+        JOBS_TABLE: jobs.tableName, APP_REGION: this.region,
         CODE_INTERPRETER_ID: codeInterpreter.attrCodeInterpreterId,
+        ENTERPRISE_READ_ONLY_TOOLS: enterpriseReadOnlyTools.join(','),
         // The AgentCore Runtime contract: the agent serves port 8080 on all interfaces of its microVM. The SDK's
         // app.run() binds 0.0.0.0 only when it sees a container (this variable); elsewhere it binds 127.0.0.1.
         DOCKER_CONTAINER: '1',
@@ -300,7 +356,7 @@ export class ChatAssistantStack extends Stack {
       environment: {
         RUNTIME_ARN: runtime.attrAgentRuntimeArn, RUNTIME_VERSION: runtime.attrAgentRuntimeVersion, JOBS_TABLE: jobs.tableName,
         ANALYSIS_TOOLS_FN: analysisFn.functionName, SESSION_SECRET_ID: sessionKey.secretName,
-        TOOL_SECRET_ID: toolKey.secretName,
+        TOOL_SECRET_ID: toolKey.secretName, LOG_SECRET_ID: logKey.secretName,
         IDP_METADATA_PARAMETER: idpParameter, SAML_SP_ENTITY_ID: config.identityCenter.samlEntityId,
         FRAME_ANCESTORS: config.frameAncestors, EXAMPLES_JSON: JSON.stringify(config.examples ?? []),
         IDENTITY_STORE_ID: config.identityCenter.identityStoreId ?? '', IDENTITY_CENTER_REGION: identityRegion,
@@ -309,9 +365,18 @@ export class ChatAssistantStack extends Stack {
       },
       description: 'Chat page, IAM Identity Center SAML login and job API for the QuickSight chat assistant.',
     });
-    jobs.grantReadWriteData(webFn);
+    for (const [actions, patterns] of [
+      [['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem'], ['????????????????????????????????']],
+      [['dynamodb:PutItem', 'dynamodb:GetItem'], ['sessjobs#*', 'revoked#*']],
+      [['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], ['browser-session#*']],
+      [['dynamodb:PutItem', 'dynamodb:DeleteItem'], ['saml#*']],
+      [['dynamodb:PutItem'], ['samlassert#*']],
+    ] as [string[], string[]][]) {
+      webFn.addToRolePolicy(new iam.PolicyStatement({ actions, resources: [jobs.tableArn], conditions: leadingKeys(patterns) }));
+    }
     sessionKey.grantRead(webFn);
     toolKey.grantRead(webFn);
+    logKey.grantRead(webFn);
     analysisFn.grantInvoke(webFn);
     webFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:StopRuntimeSession'],
@@ -342,7 +407,8 @@ export class ChatAssistantStack extends Stack {
       functionName: `${prefix}-dashboard-publisher`, runtime: lambda.Runtime.PYTHON_3_12, architecture: lambda.Architecture.ARM_64,
       handler: 'publisher.handler', code: lambda.Code.fromAsset(path.join(BUILD, 'tools-analysis')),
       timeout: Duration.minutes(5), memorySize: 256, logGroup: logGroup('DashboardPublisherLogs', `${prefix}-dashboard-publisher`),
-      environment: { ACCOUNT_ID: this.account, QS_REGION: this.region, CHAT_URL: apiUrl },
+      environment: { ACCOUNT_ID: this.account, QS_REGION: this.region, CHAT_URL: apiUrl, JOBS_TABLE: jobs.tableName,
+        LOG_SECRET_ID: logKey.secretName },
       reservedConcurrentExecutions: 1,  // one publish at a time; EventBridge retries throttled events
       description: 'After a dashboard is published, marks this solution\'s chat in it as running in a dashboard.',
     });
@@ -353,12 +419,18 @@ export class ChatAssistantStack extends Stack {
       resources: [`${qs}:dashboard/*`],
     }));
     publisherFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:PassDataSet'], resources: [`${qs}:dataset/*`] }));
+    logKey.grantRead(publisherFn);
+    publisherFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:DescribeAnalysis'], resources: analysisResources }));
+    publisherFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [jobs.tableArn],
+      conditions: leadingKeys(['dashboard#*']),
+    }));
     new events.Rule(this, 'DashboardPublished', {
       description: 'QuickSight dashboard created or updated (console publish or API)',
       eventPattern: {
         source: ['aws.quicksight'],
         detailType: ['AWS API Call via CloudTrail', 'AWS Service Event via CloudTrail'],
-        detail: { eventSource: ['quicksight.amazonaws.com'], eventName: ['CreateDashboard', 'UpdateDashboard'] },
+        detail: { eventSource: ['quicksight.amazonaws.com'], eventName: ['CreateDashboard', 'UpdateDashboard', 'DeleteDashboard'] },
       },
       targets: [new eventTargets.LambdaFunction(publisherFn, { retryAttempts: 2 })],
     });

@@ -32,26 +32,28 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
 BUILD = ROOT / "build"
-PINS = {
-    # mcp: strands-agents allows >=1.23,<2.2 and would resolve 2.1.1, which is affected by CVE-2026-116686 (client fetches
-    # server-chosen $ref URLs in tool output schemas) and three server-side CVEs; 1.30.0 is the fixed 1.x release.
-    "agent": ["strands-agents[openai]==1.61.1", "bedrock-agentcore==1.24.2", "boto3==1.43.115", "mcp==1.30.0"],
-    "web": ["boto3==1.43.115", "signxml==5.2.0", "lxml==6.1.3", "cryptography==50.0.2", "PyJWT==2.15.1"],
-    # scramp: pg8000 1.31.5 calls scramp.make_channel_binding, which scramp 1.5.0 removed
-    "tools-data": ["pg8000==1.31.5", "scramp==1.4.18", "PyMySQL==1.1.2", "PyJWT==2.15.1"],
-    "tools-analysis": ["PyJWT==2.15.1"],
-}
+LOCKS = {name: ROOT / "requirements" / f"{name}.txt"
+         for name in ("agent", "web", "tools-data", "tools-analysis")}
 SOURCES = {
-    "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py", "agent/sandbox.py"],
-    "web": ["web/handler.py", "web/auth.py", "tools/common/tokens.py", "web/index.html", "web/render.js", "web/app.js",
-            "web/vendor/echarts-6.1.0.min.js", "web/vendor/marked-18.1.1.umd.js", "web/vendor/purify-3.4.17.min.js"],
+    "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py", "agent/sandbox.py",
+              "tools/common/logging_utils.py"],
+    "web": ["web/handler.py", "web/auth.py", "tools/common/tokens.py", "tools/common/logging_utils.py",
+            "web/index.html", "web/render.js", "web/app.js", "web/vendor/echarts-6.1.0.min.js",
+            "web/vendor/marked-18.1.1.umd.js", "web/vendor/purify-3.4.17.min.js"],
     "tools-data": ["tools/data/handler.py", "tools/data/dataset.py", "tools/data/sqlcompile.py",
-                   "tools/common/caller.py", "tools/common/tokens.py", "tools/common/definition.py"],
-    "tools-analysis": ["tools/analysis/handler.py", "tools/analysis/publisher.py", "tools/common/caller.py", "tools/common/tokens.py",
-                       "tools/common/definition.py", "tools/common/edits.py"],
+                   "tools/common/caller.py", "tools/common/tokens.py", "tools/common/definition.py",
+                   "tools/common/logging_utils.py"],
+    "tools-analysis": ["tools/analysis/handler.py", "tools/analysis/publisher.py", "tools/common/caller.py",
+                       "tools/common/tokens.py", "tools/common/definition.py", "tools/common/edits.py",
+                       "tools/common/logging_utils.py"],
 }
-RDS_CA = ["https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-north-1/cn-north-1-bundle.pem",
-          "https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-northwest-1/cn-northwest-1-bundle.pem"]
+RDS_CA = [
+    ("https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-north-1/cn-north-1-bundle.pem",
+     "be7ad9909440380d292085104957f575da954e53b5f776d5d3ae0bdd009c15a6"),
+    ("https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-northwest-1/cn-northwest-1-bundle.pem",
+     "083fbecda83e22e0854d7238cb063b2b1897e7e4ac68321b640079eaeb3d5a94"),
+]
+RDS_CA_BUNDLE_SHA256 = "8b4dbbc7f655346081f43f5976c1795c0f7f0ad72565f2c2d998b8cda85e7b87"
 CHAT_VISUAL_ID = "qsca-chat"
 
 
@@ -91,13 +93,26 @@ def outputs(args, config):
 
 
 # ---------------------------------------------------------------- build
-def pip_install(target, requirements):
-    if not requirements:
-        return
+def pip_install(target, lock):
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-compile", "--disable-pip-version-check",
                     "--platform", "manylinux2014_aarch64", "--platform", "manylinux_2_28_aarch64",
                     "--implementation", "cp", "--python-version", "3.12", "--only-binary=:all:",
-                    "--target", str(target), *requirements], check=True)
+                    "--require-hashes", "--no-deps", "--target", str(target), "-r", str(lock)], check=True)
+
+
+def download_rds_ca():
+    """Download the two AWS China RDS trust stores and accept only the pinned bytes."""
+    parts = []
+    for url, expected in RDS_CA:
+        content = urllib.request.urlopen(url, timeout=30, context=tls_context()).read()
+        actual = hashlib.sha256(content).hexdigest()
+        if actual != expected:
+            raise RuntimeError(f"RDS CA checksum mismatch for {url}: expected {expected}, received {actual}")
+        parts.append(content)
+    bundle = b"".join(parts)
+    if hashlib.sha256(bundle).hexdigest() != RDS_CA_BUNDLE_SHA256:
+        raise RuntimeError("combined RDS CA checksum mismatch")
+    return bundle
 
 
 def clean_tree(path):
@@ -109,25 +124,30 @@ def clean_tree(path):
 
 
 def cmd_build(args):
+    if sys.version_info < (3, 10):
+        die("构建需要 Python 3.10 或更高版本（部署包目标为 Python 3.12）")
     BUILD.mkdir(exist_ok=True)
-    for name, requirements in PINS.items():
+    for name, lock in LOCKS.items():
+        lock_content = lock.read_bytes()
+        stamp = hashlib.sha256(lock_content).hexdigest()[:16]
         target = BUILD / name
-        stamp = hashlib.sha256(json.dumps(requirements).encode()).hexdigest()[:16]
         current = (target / ".deps").read_text() if (target / ".deps").exists() else ""
         if current != stamp:
-            print(f"==> {name}: installing {', '.join(requirements) or 'no extra packages'}")
+            print(f"==> {name}: installing hash-locked dependencies from {lock.relative_to(ROOT)}")
             shutil.rmtree(target, ignore_errors=True)
             target.mkdir(parents=True)
-            pip_install(target, requirements)
+            pip_install(target, lock)
             (target / ".deps").write_text(stamp)
         for source in SOURCES[name]:
             destination = target / pathlib.Path(source).relative_to(source.split("/")[0]) if source.startswith("web/vendor") \
                 else target / pathlib.Path(source).name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / source, destination)
-        if name == "tools-data" and not (target / "rds-ca.pem").exists():
-            bundle = b"".join(urllib.request.urlopen(url, timeout=30, context=tls_context()).read() for url in RDS_CA)
-            (target / "rds-ca.pem").write_bytes(bundle)
+        if name == "tools-data":
+            ca_file = target / "rds-ca.pem"
+            current_ca = ca_file.read_bytes() if ca_file.exists() else b""
+            if hashlib.sha256(current_ca).hexdigest() != RDS_CA_BUNDLE_SHA256:
+                ca_file.write_bytes(download_rds_ca())
         clean_tree(target)
         print(f"   build/{name}: {sum(f.stat().st_size for f in target.rglob('*') if f.is_file()) // 2**20} MB")
     # AgentCore Runtime takes a ZIP from S3 and rejects packages that contain Python cache files.
@@ -192,13 +212,57 @@ def cmd_model(args):
     print(f"已更新 {name}。Runtime 最迟 60 秒后使用新模型。")
 
 
+def _datasource_target(aws, config, datasource_id):
+    """Resolve the exact database endpoint and TLS policy the operator is approving."""
+    sys.path.insert(0, str(ROOT / "tools" / "data"))
+    sys.path.insert(0, str(ROOT / "tools" / "common"))
+    import dataset as dataset_policy  # noqa: PLC0415
+    account = aws.client("sts").get_caller_identity()["Account"]
+    source = aws.client("quicksight").describe_data_source(
+        AwsAccountId=account, DataSourceId=datasource_id)["DataSource"]
+    try:
+        info = dataset_policy.connection(source)
+    except dataset_policy.Unsupported as error:
+        raise ValueError(f"无法为数据源 {datasource_id} 保存连接目标：{error}") from error
+    if info.get("rds_instance"):
+        instance = aws.client("rds").describe_db_instances(DBInstanceIdentifier=info["rds_instance"])["DBInstances"][0]
+        info["host"], info["port"] = instance["Endpoint"]["Address"], instance["Endpoint"]["Port"]
+        engine = str(instance.get("Engine") or "").lower()
+        if "postgres" in engine:
+            info["engine"] = "postgresql"
+        elif engine in ("mysql", "mariadb", "aurora-mysql"):
+            info["engine"] = "mysql"
+        else:
+            raise ValueError(f"RDS 引擎 {engine or 'unknown'} 不受内置查询支持")
+    partition = "aws-cn" if config["region"].startswith("cn-") else "aws"
+    expected_arn = f"arn:{partition}:quicksight:{config['region']}:{account}:datasource/{datasource_id}"
+    if source.get("Arn") != expected_arn:
+        raise ValueError(f"数据源 ARN 不属于当前分区、区域和账户：{source.get('Arn')}")
+    target = {"data_source_arn": expected_arn, "engine": info.get("engine"), "host": info.get("host"),
+              "port": int(info.get("port") or 0), "database": info.get("database"), "tls_required": True}
+    if info.get("rds_instance"):
+        target["rds_instance"] = info["rds_instance"]
+    if target["engine"] not in ("postgresql", "mysql") or not target["host"] or not target["port"] or not target["database"]:
+        raise ValueError(f"数据源 {datasource_id} 的引擎、主机、端口或数据库不完整")
+    return target
+
+
 def cmd_datasource_secret(args):
     config = load_config(args)
+    aws = session(args, config)
     prefix = config["dataAccess"]["datasourceSecretPrefix"]
-    sm = session(args, config).client("secretsmanager")
+    try:
+        target = _datasource_target(aws, config, args.datasource)
+    except ValueError as error:
+        die(str(error))
+    print("将凭证绑定到以下经过 TLS 验证的数据源目标：")
+    print(json.dumps(target, ensure_ascii=False, indent=2))
+    if not args.yes and input("确认这是预期目标？[y/N] ").strip().lower() not in ("y", "yes"):
+        die("已取消，未读取或保存数据库凭证")
+    sm = aws.client("secretsmanager")
     username = input(f"数据源 {args.datasource} 的只读数据库用户名：").strip()
     password = getpass.getpass("密码（输入不回显）：")
-    name, value = prefix + args.datasource, json.dumps({"username": username, "password": password})
+    name, value = prefix + args.datasource, json.dumps({"username": username, "password": password, "target": target})
     try:
         sm.create_secret(Name=name, SecretString=value, Description=f"QuickSight data source {args.datasource} (read-only)")
         print(f"已创建 {name}")
@@ -220,8 +284,8 @@ def cmd_publish(args):
     """Publish an analysis as a dashboard whose chat knows it is in a dashboard (where=dashboard in its URL).
 
     The QuickSight console copies the analysis' chat URL unchanged, so a dashboard published there cannot tell the
-    chat that edits will not show up. This builds the dashboard from the analysis definition instead, tags it with
-    its source analysis (used for viewer permissions) and publishes the new version."""
+    chat that edits will not show up. This builds the dashboard from the analysis definition instead, adds an
+    informational source-analysis tag, publishes the new version and records version-bound authorization provenance."""
     config = load_config(args)
     s = session(args, config)
     qs = s.client("quicksight")
@@ -268,6 +332,10 @@ def cmd_publish(args):
     qs.update_dashboard_published_version(AwsAccountId=account, DashboardId=args.dashboard, VersionNumber=number)
     arn = f"arn:{partition}:quicksight:{config['region']}:{account}:dashboard/{args.dashboard}"
     qs.tag_resource(ResourceArn=arn, Tags=tags)
+    analysis_arn = f"arn:{partition}:quicksight:{config['region']}:{account}:analysis/{args.analysis}"
+    s.resource("dynamodb").Table(outputs(args, config)["JobsTable"]).put_item(Item={
+        "jobId": f"dashboard#{args.dashboard}", "dashboardArn": arn, "analysisArn": analysis_arn,
+        "versionNumber": number, "updatedAt": int(time.time())})
     print(f"已发布第 {number} 版。仪表盘里的聊天窗口知道自己在仪表盘中（where=dashboard），不会提供修改图表的功能。")
 
 
@@ -381,10 +449,16 @@ def cmd_check(args):
                 if not source_id:
                     continue
                 try:
-                    s.client("secretsmanager").describe_secret(SecretId=prefix + source_id)
-                    report(True, f"数据集 {dataset['Name']} → 数据源 {source_id}：凭证已配置")
+                    current_target = _datasource_target(s, config, source_id)
+                    record = json.loads(s.client("secretsmanager").get_secret_value(
+                        SecretId=prefix + source_id)["SecretString"])
+                    pinned = record.get("target") == current_target and isinstance(record.get("username"), str) \
+                        and isinstance(record.get("password"), str)
+                    report(pinned, f"数据集 {dataset['Name']} → 数据源 {source_id}：凭证与当前 TLS 目标一致" if pinned
+                           else f"数据集 {dataset['Name']} → 数据源 {source_id}：凭证目标已漂移或是旧格式；"
+                                f"核对后运行 ./qsca datasource-secret {source_id}")
                 except Exception:  # noqa: BLE001
-                    report(False, f"数据集 {dataset['Name']} → 数据源 {source_id}：缺少凭证 {prefix}{source_id}"
+                    report(False, f"数据集 {dataset['Name']} → 数据源 {source_id}：缺少或无法读取凭证 {prefix}{source_id}"
                                   f"（./qsca datasource-secret {source_id}）")
     sys.exit(0 if ok else 1)
 
@@ -433,12 +507,17 @@ def cmd_smoke(args):
         status, result = http("GET", f"{base}/jobs/{job['jobId']}", token)
         if result.get("status") != "RUNNING":
             break
-    print(json.dumps({k: result.get(k) for k in ("status", "error", "answer", "steps", "totalMs")}, ensure_ascii=False, indent=1))
+    print(json.dumps({k: result.get(k) for k in ("status", "error", "answer", "steps", "totalMs")},
+                     ensure_ascii=True, indent=1))
     for chart in result.get("charts") or []:
-        print(f"chart: {chart['type']} {chart['title']} points={len(chart['x'])} series={[s['name'] for s in chart['series']]}"
-              f"{' pending_change=' + chart['pending_change']['id'] if chart.get('pending_change') else ''}")
+        terminal_chart = {"type": chart.get("type"), "title": chart.get("title"),
+                          "points": len(chart.get("x") or []),
+                          "series": [series.get("name") for series in chart.get("series") or []]}
+        if chart.get("pending_change"):
+            terminal_chart["pending_change"] = chart["pending_change"].get("id")
+        print("chart:", json.dumps(terminal_chart, ensure_ascii=True, separators=(",", ":")))
     if result.get("controls"):
-        print("controls:", result["controls"])
+        print("controls:", json.dumps(result["controls"], ensure_ascii=True, separators=(",", ":")))
     sys.exit(0 if result.get("status") == "SUCCEEDED" else 1)
 
 
@@ -464,6 +543,7 @@ def main():
     model.set_defaults(func=cmd_model)
     secret = sub.add_parser("datasource-secret")
     secret.add_argument("datasource", help="QuickSight data source id")
+    secret.add_argument("--yes", action="store_true", help="approve the displayed database target non-interactively")
     secret.set_defaults(func=cmd_datasource_secret)
     attach = sub.add_parser("attach")
     attach.add_argument("analysis")

@@ -43,7 +43,7 @@ cn-north-1).
 ```
 QuickSight analysis / dashboard
   └ Custom visual content (iframe): chat page
-       │ HTTPS + session token (after IAM Identity Center SAML sign-in)
+       │ HTTPS + opaque HttpOnly session cookie (after IAM Identity Center SAML sign-in)
        ▼
 API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB (jobs, sign-in state, pending edits)
                          │ │                                           ▲ heartbeats / result
@@ -63,9 +63,9 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
 Model: your OpenAI-compatible endpoint, e.g. Bedrock bedrock-runtime /openai/v1 (URL and key in Secrets Manager)
 ```
 
-Everything is one CDK stack in the QuickSight region. The `Apply` button calls the web Lambda, which invokes the
-analysis tools Lambda directly as that user (with a 5-minute tool token); the model can preview and undo edits but can
-never apply them.
+Everything is one CDK stack in the QuickSight region. The `Apply`, publish and undo confirmation buttons call the web
+Lambda, which invokes the analysis tools Lambda directly as that user with a 5-minute tool token. The model can create
+an edit preview, but only an explicit, CSRF-protected button request can apply, publish or undo a change.
 
 ## Repository layout
 
@@ -89,7 +89,7 @@ never apply them.
 | AWS | Account and the QuickSight region (cn-north-1 verified); admin-level deploy permissions |
 | QuickSight | Enterprise edition, users sign in through IAM Identity Center; QuickSight user emails match Identity Center emails, one active QuickSight user per email |
 | Model | OpenAI-compatible Chat Completions endpoint with tool calling and streaming, reachable from the Runtime over public HTTPS (Amazon Bedrock, OpenAI-compatible providers, or a gateway such as LiteLLM for other APIs) |
-| Machine | macOS or Linux, Node.js 20+, Python 3.9+ with `pip`, `boto3` and `PyJWT` (`PyJWT` only for `qsca smoke` and the tests), access to npm and PyPI (mirrors work: `npm config set registry …`, `PIP_INDEX_URL`). No Docker needed |
+| Machine | macOS or Linux, Node.js 20+, Python 3.10+ with `pip`, `boto3` and `PyJWT` (`PyJWT` only for `qsca smoke` and the tests; deployment bundles target Python 3.12), access to npm and PyPI (mirrors work: `npm config set registry …`, `PIP_INDEX_URL`). No Docker needed |
 | CDK bootstrap | Once per account/region: `cd infra && npm ci && npx cdk bootstrap aws://<account>/<region>` |
 
 ### 1. Configure
@@ -105,12 +105,16 @@ cp config.example.json config.json
 | `quickSight.namespace` / `allowedAnalysisIds` | QuickSight namespace (usually `default`); analyses the chat may be attached to (`["*"]` = any, still per-user permissions) |
 | `identityCenter.samlEntityId` | SAML audience you choose, e.g. `urn:quicksight-chat-assistant:chat` |
 | `identityCenter.identityStoreId` / `region` | Optional: where to look up users' display names. Default: the Identity Center instance in the deployment region |
-| `dataAccess.vpc` | VPC for the data tools Lambda when the databases are in a VPC: `{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }` (`null` if they are public). Reusing the `vpcId` and subnets of the QuickSight VPC connection is the easiest choice |
-| `dataAccess.vpc.securityGroupIds` | Extra security groups for the Lambda (e.g. one the database already allows) |
-| `dataAccess.vpc.createInterfaceEndpoints` | `true` creates QuickSight and Secrets Manager interface endpoints (needed when the subnets have no NAT); `false` if the VPC already has them |
-| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets: replace the example's `REPLACE_ME/datasource/` with your own, e.g. `quicksight-chat-assistant/datasource/`; a literal prefix used only for these secrets, which must not cover `<prefix>/session-key`, `tool-key` or `model-config` |
+| `dataAccess.vpc` | VPC for the data tools Lambda when databases are private: `{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints, databaseEgress, endpointHttpsCidrs?, dynamodbEndpointUrl?, rdsEndpointUrl? }` (`null` for public databases). Reusing the QuickSight VPC connection's VPC/subnets is usually easiest |
+| `dataAccess.vpc.databaseEgress` | Required explicit database destinations for the owned Lambda security group, for example `[{"cidr":"10.0.0.0/16","port":5432}]`; add each PostgreSQL/MySQL CIDR and port actually used |
+| `dataAccess.vpc.securityGroupIds` | Optional extra security groups for inbound database allowlisting. Their outbound rules are additive and **must not** widen egress beyond configured endpoint HTTPS and database destinations |
+| `dataAccess.vpc.createInterfaceEndpoints` | `true` creates QuickSight, Secrets Manager, DynamoDB and RDS API interface endpoints and allows TCP 443 only to their security group |
+| `dataAccess.vpc.endpointHttpsCidrs` | Required when `createInterfaceEndpoints` is `false`: private CIDRs of the existing QuickSight, Secrets Manager, DynamoDB and RDS API endpoints, allowed on TCP 443 |
+| `dataAccess.vpc.dynamodbEndpointUrl` / `rdsEndpointUrl` | Required when `createInterfaceEndpoints` is `false`: exact HTTPS service origins for the existing DynamoDB and RDS API interface endpoints. In China regions, use the endpoint-specific DynamoDB URL and the endpoint-specific RDS URL or documented `rds-api` URL |
+| `dataAccess.datasourceSecretPrefix` | Prefix of database credential secrets: replace the example's `REPLACE_ME/datasource/` with your own, e.g. `quicksight-chat-assistant/datasource/`; a literal prefix used only for these secrets, which must not cover `<prefix>/session-key`, `tool-key`, `log-key` or `model-config` |
 | `dataAccess.extraSecretArns` | Ignored (accepted so older config files still load): the data tools read only their own `<datasourceSecretPrefix><DataSourceId>` secrets, never QuickSight's |
-| `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
+| `mcpTargets` | Enterprise MCP servers (see below); `[]` for none. Targets are registered but unavailable to the model unless individual tools are allowlisted |
+| `enterpriseReadOnlyTools` | Exact reviewed read-only tool names in `<target>___<tool>` form. Defaults to `[]`; only listed tools are exposed to the model |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job and how long a job's tool token lasts) |
 | `sessionSeconds` | Optional: how long a browser sign-in lasts, 300-43200 seconds (default 3600 = 1 h) |
 | `api.rateLimit` / `burstLimit` | HTTP API throttling |
@@ -183,10 +187,14 @@ After switching models, run `tests/e2e.py`: how well a model fills in tool argum
 
 QuickSight does not reveal stored database passwords, and the assistant never uses the secret of the QuickSight data
 source itself. For each QuickSight **data source** the analyses use, create a **dedicated database user that can only
-SELECT** the tables behind the datasets, and store it in the same region (required; there is no fallback):
+SELECT** the tables behind the datasets, and store it in the same region (required; there is no fallback). The helper
+reads the current QuickSight data source (and RDS endpoint, where applicable), displays its exact ARN, engine, host,
+port and database, requires operator approval, and stores that target with `tls_required: true` beside the credential:
 
-- name `<datasourceSecretPrefix><DataSourceId>`, value `{"username": "...", "password": "..."}`
-- `./qsca --profile <p> datasource-secret <DataSourceId>` creates it; `./qsca check --analysis <id>` lists the ones needed.
+- name `<datasourceSecretPrefix><DataSourceId>`, value `{"username":"…","password":"…","target":{…}}`
+- `./qsca --profile <p> datasource-secret <DataSourceId>` approves and creates it; `./qsca check --analysis <id>`
+  verifies every saved target against current QuickSight/RDS metadata. Use `--yes` only after reviewing the displayed
+  target in automation.
 
 ```sql
 -- PostgreSQL / Aurora PostgreSQL
@@ -200,11 +208,25 @@ GRANT SELECT ON <db>.<table> TO 'qsca_reader'@'%';
 ```
 
 Built-in queries support datasets with one **relational table** (`RelationalTable`); custom SQL datasets are refused.
-Only the columns the analysis itself references (field wells, filters, controls, calculated fields) can be described,
-queried or listed.
+Dataset and tag RLS must both be explicitly `DISABLED`. Caller CLS is applied after shared metadata-cache reads.
+Only columns present in visual field wells or reachable controls of the exact authorized analysis/dashboard definition
+can be described or selected. Fixed-filter dependencies remain internal only when CLS permits them for that caller;
+a mandatory filter on a CLS-denied column rejects the direct query. Enabled whole-analysis category, time and numeric
+filters are ANDed into every query. Their parameter values come from complete declaration defaults; URL values may
+override them only for viewer-reachable controls and only after type, single/multi-value and static-choice validation.
+A partial-sheet/visual, cross-dataset, OR, unsupported parameter, or unsupported active filter causes the direct query
+to fail closed.
 
-Allow the data tools Lambda in the database security group (its security group, the subnet ranges, or a group you add
-via `securityGroupIds`). Cross-region databases over VPC peering work as well.
+The data Lambda always verifies the database certificate and hostname. `DisableSsl`, a changed target pin, a MySQL
+server without pre-authentication TLS capability, or a connected session without TLS is refused before query data is
+sent. Configure `databaseEgress` for those exact database routes. The stack-owned security group has no default
+egress; it allows only configured database CIDR/ports and HTTPS to QuickSight, Secrets Manager, DynamoDB and RDS API
+interface endpoints. With `createInterfaceEndpoints: true`, the stack creates all four and configures the data Lambda
+to use the endpoint-specific DynamoDB and RDS API URLs. With `false`, supply all endpoint CIDRs plus
+`dynamodbEndpointUrl` and `rdsEndpointUrl`. Any group added
+through `securityGroupIds` has additive rules, so audit it and do not attach one with NAT, internet, or broader VPC
+egress. Allow the owned data Lambda group inbound at the database. Cross-region VPC peering works when its precise
+CIDR and port are listed.
 
 ### 6. Attach to an analysis
 
@@ -231,9 +253,13 @@ or simply **Publish** in the QuickSight console. The browser does not tell the c
 and a console publish copies the analysis' chat URL unchanged, so after every dashboard publish (console or API) an
 EventBridge rule runs the `<prefix>-dashboard-publisher` Lambda: it adds `where=dashboard` to this solution's chat URL
 in the new version and publishes that (about 20 seconds; refresh the dashboard afterwards). The chat in a dashboard
-then offers no edits (edits change the analysis, never a published dashboard) and says where to make them. The
-dashboard is also tagged with its source analysis, which keeps dashboard-only viewers allowed. `qsca publish` does
-the same in one step. Optional: a parameter `pViewer` whose dynamic default is the
+then offers no edits (edits change the analysis, never a published dashboard) and says where to make them. A
+validated publish also writes a version-bound `dashboard#…` provenance record to the application table. Dashboard
+source IDs and ARNs are normalized to the same exact same-partition/account/region ARN and must agree when both the
+event and dashboard version provide them; the publisher records the final marked version. Dashboard tags remain
+informational and never grant access. Dashboard-only viewers are authorized against that exact published dashboard
+definition; QuickSight's exact same-account/region `SourceEntityArn` is also accepted. `qsca publish` does the same in
+one step. Optional: a parameter `pViewer` whose dynamic default is the
 viewer's email lets the chat detect a QuickSight user switch in the same browser (not used for authorization).
 
 ### 7. Check
@@ -249,15 +275,19 @@ python3 tests/e2e.py --profile <p> --analysis <id> --editor <email> [--other-edi
 ### Enterprise MCP servers (optional)
 
 ```json
-"mcpTargets": [
+{
+  "mcpTargets": [
   {"name": "datahub", "endpoint": "https://mcphub.example.com/datahub/mcp",
    "auth": {"type": "oauth", "providerArn": "arn:aws-cn:bedrock-agentcore:cn-north-1:<acct>:token-vault/default/oauth2credentialprovider/datahub", "scopes": ["read"]}},
   {"name": "metabase", "endpoint": "https://mcphub.example.com/metabase/mcp",
    "auth": {"type": "apiKey", "providerArn": "arn:aws-cn:...:apikeycredentialprovider/metabase", "parameterName": "X-API-Key"}}
-]
+  ],
+  "enterpriseReadOnlyTools": ["datahub___search", "metabase___list_questions"]
+}
 ```
 
-`auth.type`: `none`, `oauth` / `apiKey` (create the AgentCore Identity credential provider first), or `iam`
+Registering a target does not expose any of its tools. Review each tool as read-only and list its exact Gateway name in
+`enterpriseReadOnlyTools`; all other enterprise tools stay unavailable to the model. `auth.type`: `none`, `oauth` / `apiKey` (create the AgentCore Identity credential provider first), or `iam`
 (`service: "bedrock-agentcore"`, `runtimeArn`, optional `region`, for MCP servers hosted on AgentCore Runtime). The
 endpoint must be public HTTPS (in China regions the gateway has no VPC egress) and support MCP protocol `2025-03-26`.
 These servers never receive the user's identity: expose read-only tools only.
@@ -277,11 +307,17 @@ Migrating from a version before the security hardening (see [docs/security-threa
 - Database credentials come only from `<datasourceSecretPrefix><DataSourceId>` (`./qsca datasource-secret`) with a
   SELECT-only user; the fallback to the QuickSight data source's own secret and `extraSecretArns` are gone.
   `datasourceSecretPrefix` must be a literal prefix (no `*` or `?`) that does not cover `<prefix>/session-key`,
-  `<prefix>/tool-key` or `<prefix>/model-config` (deploy refuses it otherwise), and the secrets must be in the
+  `<prefix>/tool-key`, `<prefix>/log-key` or `<prefix>/model-config` (deploy refuses it otherwise), and the secrets must be in the
   stack's region.
-- Custom SQL datasets are refused by the built-in queries, and only columns the analysis references are offered.
-- The browser keeps the sign-in in sessionStorage: each browser tab signs in once; **退出** also cancels that
-  sign-in's running answers, and the analysis tools refuse its tool tokens.
+- Database credential records now include an operator-approved QuickSight/RDS target and mandatory TLS pin. Re-run
+  `./qsca datasource-secret` for every data source after deploying; old username/password-only records fail closed.
+- Built-in queries refuse either RLS form unless explicitly disabled, apply caller CLS, expose only visual/control
+  columns from the authorized analysis or dashboard definition, and enforce reproducible whole-analysis filters.
+- Browser authentication now uses a server-side opaque session referenced by a `Secure; HttpOnly; SameSite=None`
+  `__Host-qsca-session` cookie. The popup sends no credential to page script. The page reads identity and a separate
+  CSRF token from `/me`; every authenticated POST must present that token. Existing browser bearer sessions stop
+  working after deployment, so users sign in again. **退出** deletes the opaque session, revokes derived tool tokens
+  and cancels that sign-in's running answers.
 
 ## Use
 
@@ -335,11 +371,11 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
    - *Change "Price trend" to a bar chart* · *Show it by month* · *Use the sum of energy instead* · *Split by station*
    - *Sort descending by value* · *Rename it to …* · *Add a table of average price by station* · *Delete that chart*
    - Each request shows a **preview** (chart or table drawn with the edited visual's data) with **Apply** / **Discard**.
-     After applying, **refresh the page** (the editor does not refresh by itself). Say **undo** to revert the latest
-     applied change (repeatable). After **Apply**, **发布到仪表盘** (or typing "发布到仪表盘") publishes the analysis as
-     it is now to the dashboards published from it that the user may update, with the chat marked; the button stays
-     after a page refresh. Edits change the analysis only; republish the dashboard to update it. In a
-     dashboard the chat offers no edits.
+     After applying, **refresh the page** (the editor does not refresh by itself). Sending **undo** or **force undo**
+     creates a confirmation; the change is restored only when you press the displayed button. After **Apply**,
+     **发布到仪表盘** publishes the analysis only when you press its confirmation button. Sending the same words also
+     creates that confirmation and never publishes directly. The button stays after a page refresh. Edits change the
+     analysis only; republish the dashboard to update it. In a dashboard the chat offers no edits.
 4. **Cancel** stops a running answer; a page refresh (e.g. after picking a control value) resumes a running answer.
    The browser keeps 8 hours of conversation per user and analysis.
 
@@ -348,16 +384,16 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 | Topic | Mechanism |
 |---|---|
 | Sign-in | Only users assigned to the Identity Center app; SAML assertions checked for signature (against every signing certificate in the app metadata, so a certificate rotation keeps working), issuer, audience, ACS, request ID, validity and replay; assertions without an ID are refused |
-| Session | JWT signed with HS256 (PyJWT) with the `session-key` secret (readable only by the web Lambda), 1 hour by default (`sessionSeconds`), stored in the tab's sessionStorage; accepted only by the web Lambda; **退出** revokes it on the server at once and cancels its running answers |
-| Chat page | Content-Security-Policy: scripts only from the page's own origin (no inline script, content-hashed file names), requests only to its API, no plugins or form posts, embeddable only by `frameAncestors`; styles allow inline (ECharts tooltips). The page builds its UI with DOM nodes (text, never HTML strings); Markdown goes through one DOMPurify boundary, without images, iframes, styles, classes, `div` or `span` |
-| Who sees data | Users must be able to view the analysis or a dashboard published from it; only that analysis' datasets can be queried. The signed-in email must match exactly one active QuickSight user (several are refused, not merged) |
-| Dataset rules | Datasets with row-level security, dataset filters, joins or custom SQL are refused (querying the source would bypass them); only columns the analysis references are offered; columns under column-level security are hidden from users not granted them; a dedicated SELECT-only database user |
-| Queries | The model never writes SQL: structured requests, column names checked against the dataset, fixed aggregates and operators, bound parameters, read-only transaction, 20 s timeout, at most 500 rows |
+| Session | The browser receives only an opaque random ID in a `Secure; HttpOnly; SameSite=None; Path=/` `__Host-qsca-session` cookie; claims and a separate CSRF token live in DynamoDB. `/me` returns identity and the CSRF token, and every authenticated POST requires it. The session lasts 1 hour by default (`sessionSeconds`). The signed HS256 session JWT path remains only for the administrator `qsca smoke` command; **退出** deletes and revokes the browser session and cancels its running answers |
+| Chat page | Content-Security-Policy: scripts only from the page's own origin (no inline script, content-hashed file names), requests only to its API, no plugins or form posts. `frameAncestors` accepts only unique exact HTTPS origins, without wildcards, paths, credentials, query strings or fragments. Styles allow inline declarations for ECharts tooltips. The page builds its UI with DOM nodes (text, never HTML strings); Markdown goes through one DOMPurify boundary, without images, iframes, styles, classes, `div` or `span` |
+| Who sees data | Users need `DescribeAnalysis`, or `DescribeDashboard` on a dashboard with exact QuickSight source provenance or a version-bound application mapping. Dashboard-only users get that published dashboard definition, never the live analysis draft. Tags do not authorize. The signed-in email must match exactly one active QuickSight user |
+| Dataset rules | Dataset and tag RLS must be explicitly disabled; dataset filters, joins and custom SQL are refused. Caller CLS is applied after cache reads. Only visual/reachable-control columns are discoverable or included in model-visible visual, filter, control and parameter metadata; calculated fields with a CLS-denied dependency are omitted. Mandatory-filter columns remain policy-only only when CLS permits them, and control overrides require declaration type/multiplicity/static-choice validation. Credentials are bound to an approved target and verified TLS session |
+| Queries | The model never writes SQL: structured requests, caller-visible columns, fixed aggregates/operators, bound parameters, read-only transaction, 20 s timeout and at most 500 rows. Reproducible whole-analysis filters are always ANDed in; unsupported active scope/filter shapes fail closed |
 | Sandbox | Code Interpreter in SANDBOX network mode, no execution role: it only receives result rows the user could already query |
 | Who edits | `quicksight:UpdateAnalysis` on that analysis for the user (QuickSight sharing); apply only by the requester, once, within 10 minutes; the previous definition is backed up to S3 before every change |
 | Identity to tools | Tools never get the browser's token. The web Lambda issues a tool token signed with the separate `tool-key` per job (bound to the user, the analysis and the sign-in, valid as long as the Runtime session may run) or per button click (5 minutes); the Runtime adds it to this solution's own tool calls in code; the model cannot see or forge it; enterprise MCP servers do not get it. Tool Lambdas refuse session tokens and tokens issued for another analysis; the analysis tools also refuse tokens of a signed-out sign-in |
-| Permission changes | QuickSight users, groups and sharing are cached up to 60 s, so a removed share or group membership takes effect within a minute; the list of dashboards published from an analysis is cached 5 minutes (a dashboard republished from another analysis keeps its viewers' access to the old analysis that long) |
-| Data flow | Questions and results go to your model endpoint; CloudWatch logs never contain tokens or passwords, and do not log the sign-in email (a non-reversible per-user reference is used instead), the SAML attributes, or model-output text (only sizes/counts for diagnostics) |
+| Permission changes | QuickSight users, groups and sharing are cached up to 60 s. Dashboard provenance is bound to the exact version; a mismatched or deleted dashboard mapping is removed by the publisher and cannot authorize even while cached. Runtime DynamoDB writes are limited to exactly 32-character job keys; other components are limited by action and key namespace |
+| Data flow | Questions and results go to your model endpoint. Analysis metadata, control values, browser history and every tool result are scrubbed, bounded and placed in per-run randomized untrusted-data envelopes; they never enter the system role. Enterprise tools are absent unless their exact reviewed read-only names appear in `enterpriseReadOnlyTools`. CloudWatch logs never contain tokens, passwords, exception messages, SAML attributes or model-output text. User references are HMAC-SHA256 pseudonyms backed by a dedicated generated log key; diagnostics contain only sizes, counts, exception classes and correlation IDs |
 
 SPICE datasets: built-in queries read the current source data, which may be newer than the last SPICE refresh (the
 answer says so).
@@ -376,7 +412,7 @@ for analysis, not as decisions.
 | Accuracy | The model can misread a question, pick the wrong column or filter, or describe a result incorrectly. Numbers in charts and previews are read from tool results by code and never typed by the model, but the text around them comes from the model: check important answers against the analysis |
 | Transparency | Each answer lists the tools it called with their arguments, and shows the model name and the time taken. Answers say when data came directly from the source instead of the SPICE copy |
 | Human oversight | The model cannot change an analysis by itself. An edit is shown as a preview with the data it would display, and the analysis changes only when the requester presses **应用到分析**; the previous definition is backed up first, and the last change can be undone |
-| Untrusted content | Dataset values, analysis text and enterprise MCP results can contain instructions aimed at the model (prompt injection). The model never sets the user identity or the analysis and never writes SQL, its Markdown cannot load images or other remote content, and permissions are checked by the tools, not by the model |
+| Untrusted content | Dataset values, analysis text, URL-bound controls, browser history and enterprise MCP results can contain instructions aimed at the model (prompt injection). The runtime rejects tool responses above a fixed raw UTF-8 byte limit or nesting depth before JSON parsing, then applies global node/depth budgets while scrubbing containers and strings before wrapping each source in a randomized untrusted-data envelope outside the system role. This reduces accidental instruction following but does not prove that a model will ignore every injection. Identity, analysis and parameters are injected in code; permissions and the enterprise-tool allowlist are enforced outside the model |
 | Content filtering | The sample does not configure Amazon Bedrock Guardrails or another content filter: the model is any OpenAI-compatible endpoint, and Amazon Bedrock is not offered in the AWS China Regions. If your use requires content filtering, apply it at your model endpoint or gateway (for example Bedrock Guardrails when you use Amazon Bedrock in a supported Region) |
 | Bias | Answers reflect the data in the analysis and the behavior of the model you choose. The sample does not test models for bias; evaluate the model you configure with your own users and data |
 | Data sent to the model | Questions, the last turns of the conversation, the analysis structure and query results go to your model endpoint (see *Data flow* above); choose an endpoint whose data-use terms meet your requirements |
@@ -384,7 +420,7 @@ for analysis, not as decisions.
 ## Cost
 
 Usage-based: AgentCore Runtime (active session CPU/memory time), Gateway calls, Code Interpreter sessions, Lambda, API
-Gateway, DynamoDB on demand, Secrets Manager secrets, **VPC interface endpoints (2 endpoints × subnets, hourly; usually
+Gateway, DynamoDB on demand, Secrets Manager secrets, **VPC interface endpoints (4 endpoints × subnets, hourly; usually
 the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing calculator for estimates.
 
 ## Troubleshooting
@@ -416,7 +452,7 @@ model call that runs longer than 20 s, `model_retry` the automatic retries).
 ## Limitations
 
 - Built-in data queries: PostgreSQL, Aurora PostgreSQL, MySQL, Aurora MySQL, MariaDB, RDS (PostgreSQL / MySQL); single
-  relational-table datasets, only the columns the analysis references. Custom SQL datasets, Athena, Redshift, S3 and
+  relational-table datasets, only caller-visible visual and reachable-control columns from the authorized definition. Custom SQL datasets, Athena, Redshift, S3 and
   others: not supported (use an enterprise MCP server).
 - Editing covers line, bar and table visuals (aggregated field wells); sheets with section-based layouts cannot get
   new visuals automatically; deleting a visual referenced by filters or actions is refused.
@@ -432,8 +468,13 @@ python3.12 -m venv ~/.venvs/qsca && ~/.venvs/qsca/bin/pip install signxml==5.2.0
 ACCOUNT_ID=0 SESSION_SECRET_ID=x TOOL_SECRET_ID=y QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-north-1 ~/.venvs/qsca/bin/python -m unittest discover -s tests/unit
 (cd infra && npm ci && npx tsc --noEmit && npm test)   # npm test: config validation
 (cd tests/js && npm ci && npm test)   # chat page rendering in jsdom (dev only)
-./qsca build
+~/.venvs/qsca/bin/python ./qsca build
 ```
+
+`qsca build` installs each bundle only from its committed `requirements/*.txt` transitive lock with
+`--require-hashes --no-deps`; dependency stamps are derived from lock contents. The build also verifies fixed SHA-256
+values for both downloaded AWS China RDS CA files before bundling them. Update the matching `requirements/*.in` and
+regenerate/review the complete hash lock whenever a dependency changes; do not hand-edit only a direct version.
 
 The unit tests need `boto3` and `PyJWT`; the SAML and sign-out tests in `tests/unit/test_auth.py` also need `signxml`,
 `lxml` and `cryptography` at the pinned versions below (skipped otherwise; the venv above has them).
@@ -477,7 +518,7 @@ Bedrock，或 LiteLLM 等网关），随时可以切换，无需重新部署。�
 ```
 QuickSight 分析 / 仪表盘
   └ 自定义可视内容（iframe）：聊天页
-       │ HTTPS + 会话令牌（IAM Identity Center SAML 登录后）
+       │ HTTPS + 不透明 HttpOnly 会话 Cookie（IAM Identity Center SAML 登录后）
        ▼
 API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB（任务、登录状态、待确认修改）
                          │ │                                           ▲ 心跳 / 结果
@@ -497,8 +538,8 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
 模型：你的 OpenAI 兼容端点，如 Bedrock bedrock-runtime /openai/v1（地址和 Key 存在 Secrets Manager）
 ```
 
-所有资源在 QuickSight 所在区域的一个 CDK 栈里。“应用到分析”按钮调用 Web Lambda，由它以该用户身份（带 5 分钟的工具令牌）直接调用
-分析工具 Lambda；模型可以预览和撤销修改，但永远不能应用修改。
+所有资源在 QuickSight 所在区域的一个 CDK 栈里。“应用到分析”、发布和撤销确认按钮调用 Web Lambda，由它以该用户身份、携带
+5 分钟工具令牌直接调用分析工具 Lambda。模型可以生成修改预览，但应用、发布和撤销都只能由显式、带 CSRF 校验的按钮请求执行。
 
 ## 仓库结构
 
@@ -522,7 +563,7 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
 | AWS | 账号和 QuickSight 所在区域（已验证 cn-north-1）；管理员级部署权限 |
 | QuickSight | 企业版，用户通过 IAM Identity Center 登录；QuickSight 用户邮箱与 Identity Center 邮箱一致，且每个邮箱只对应一个活跃的 QuickSight 用户 |
 | 模型 | OpenAI 兼容的 Chat Completions 端点，支持工具调用和流式输出，Runtime 能经公网 HTTPS 访问（Amazon Bedrock、各家 OpenAI 兼容接口，或用 LiteLLM 等网关转换其他接口） |
-| 部署机器 | macOS 或 Linux，Node.js 20+，Python 3.9+（带 `pip`、`boto3` 和 `PyJWT`；`PyJWT` 只有 `qsca smoke` 和测试需要），能访问 npm 和 PyPI（可用镜像：`npm config set registry …`、`PIP_INDEX_URL`）。不需要 Docker |
+| 部署机器 | macOS 或 Linux，Node.js 20+，Python 3.10+（带 `pip`、`boto3` 和 `PyJWT`；`PyJWT` 只有 `qsca smoke` 和测试需要；部署包目标为 Python 3.12），能访问 npm 和 PyPI（可用镜像：`npm config set registry …`、`PIP_INDEX_URL`）。不需要 Docker |
 | CDK 引导 | 每个账号 / 区域一次：`cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>` |
 
 ### 1. 配置
@@ -538,12 +579,16 @@ cp config.example.json config.json
 | `quickSight.namespace` / `allowedAnalysisIds` | QuickSight 命名空间（通常是 `default`）；允许接入聊天的分析（`["*"]` 表示任意分析，仍按用户权限检查） |
 | `identityCenter.samlEntityId` | 你自定的 SAML 受众，如 `urn:quicksight-chat-assistant:chat` |
 | `identityCenter.identityStoreId` / `region` | 可选：到哪里查用户显示名。默认：部署区域里的 Identity Center 实例 |
-| `dataAccess.vpc` | 数据库在 VPC 内时，数据工具 Lambda 使用的 VPC：`{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints }`（数据库可公网访问时填 `null`）。最简单的做法是复用 QuickSight VPC 连接的 `vpcId` 和子网 |
-| `dataAccess.vpc.securityGroupIds` | 给 Lambda 额外加的安全组（如数据库已放行的某个组） |
-| `dataAccess.vpc.createInterfaceEndpoints` | `true` 创建 QuickSight 和 Secrets Manager 接口端点（子网没有 NAT 时需要）；VPC 已有时填 `false` |
-| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀：把示例里的 `REPLACE_ME/datasource/` 换成自己的前缀，例如 `quicksight-chat-assistant/datasource/`；只用于这些密钥的固定前缀，不能覆盖 `<prefix>/session-key`、`tool-key` 或 `model-config` |
+| `dataAccess.vpc` | 数据库在 VPC 内时数据工具 Lambda 使用的 VPC：`{ vpcId, subnetIds, securityGroupIds, createInterfaceEndpoints, databaseEgress, endpointHttpsCidrs?, dynamodbEndpointUrl?, rdsEndpointUrl? }`；公网数据库填 `null` |
+| `dataAccess.vpc.databaseEgress` | 必填的数据库目标，例如 `[{"cidr":"10.0.0.0/16","port":5432}]`；逐项填写实际 PostgreSQL/MySQL 网段和端口 |
+| `dataAccess.vpc.securityGroupIds` | 可选的额外安全组，只用于数据库入站放行；安全组出口会叠加，**不得**放宽到配置之外的端点 HTTPS 或数据库目标 |
+| `dataAccess.vpc.createInterfaceEndpoints` | `true` 创建 QuickSight、Secrets Manager、DynamoDB 和 RDS API 接口端点，TCP 443 只放行到其安全组 |
+| `dataAccess.vpc.endpointHttpsCidrs` | `createInterfaceEndpoints` 为 `false` 时必填：已有 QuickSight、Secrets Manager、DynamoDB 和 RDS API 接口端点的私网 CIDR，只放行 TCP 443 |
+| `dataAccess.vpc.dynamodbEndpointUrl` / `rdsEndpointUrl` | `createInterfaceEndpoints` 为 `false` 时必填：已有 DynamoDB 和 RDS API 接口端点的准确 HTTPS 服务来源；中国区使用 DynamoDB 端点专用 URL，以及 RDS 端点专用 URL 或文档所述的 `rds-api` URL |
+| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀：把示例里的 `REPLACE_ME/datasource/` 换成自己的前缀，例如 `quicksight-chat-assistant/datasource/`；只用于这些密钥的固定前缀，不能覆盖 `<prefix>/session-key`、`tool-key`、`log-key` 或 `model-config` |
 | `dataAccess.extraSecretArns` | 已忽略（保留只为兼容旧配置文件）：数据工具只读取自己的 `<datasourceSecretPrefix><DataSourceId>` 密钥，从不使用 QuickSight 的 |
-| `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]` |
+| `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]`。只注册目标不会把工具开放给模型，必须逐个列入名单 |
+| `enterpriseReadOnlyTools` | 已由操作员审核为只读的准确工具名，格式 `<target>___<tool>`。默认为 `[]`，模型只能看到名单内的工具 |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长，以及任务的工具令牌的有效期） |
 | `sessionSeconds` | 可选：浏览器一次登录的有效期，300-43200 秒（默认 3600 = 1 小时） |
 | `api.rateLimit` / `burstLimit` | HTTP API 限流 |
@@ -609,10 +654,13 @@ AWS 中国区没有 Bedrock，从中国区调用会跨境访问海外区域；�
 ### 5. 数据库凭证（内置数据查询）
 
 QuickSight 不会提供已保存的数据库密码，助手也从不使用 QuickSight 数据源自己的密钥。分析用到的每个 QuickSight **数据源**，
-都要创建一个 **专用的、只能 SELECT** 数据集背后那些表的数据库用户，并保存在同一区域（必需，没有其他来源）：
+都要创建一个 **专用的、只能 SELECT** 数据集背后那些表的数据库用户，并保存在同一区域（必需，没有其他来源）。命令会读取
+当前 QuickSight 数据源（RDS 时还会解析实例端点），显示准确 ARN、引擎、主机、端口和数据库，由操作员确认后把该目标与
+`tls_required: true` 和凭证一起保存：
 
-- 名称 `<datasourceSecretPrefix><DataSourceId>`，内容 `{"username": "...", "password": "..."}`
-- `./qsca --profile <p> datasource-secret <DataSourceId>` 可创建；`./qsca check --analysis <id>` 列出需要哪些。
+- 名称 `<datasourceSecretPrefix><DataSourceId>`，内容 `{"username":"…","password":"…","target":{…}}`
+- `./qsca --profile <p> datasource-secret <DataSourceId>` 确认并创建；`./qsca check --analysis <id>` 会比较当前元数据与保存目标。
+  自动化只有在预先核对显示目标后才应使用 `--yes`。
 
 ```sql
 -- PostgreSQL / Aurora PostgreSQL
@@ -625,11 +673,17 @@ CREATE USER 'qsca_reader'@'%' IDENTIFIED BY '<password>';
 GRANT SELECT ON <db>.<table> TO 'qsca_reader'@'%';
 ```
 
-内置查询支持只有一个 **关系表**（`RelationalTable`）的数据集；自定义 SQL 数据集会被拒绝。只能描述、查询和列出分析本身用到的列
-（字段井、筛选、控件、计算字段）。
+内置查询支持只有一个 **关系表**（`RelationalTable`）的数据集；自定义 SQL 数据集会被拒绝。数据集 RLS 和标签 RLS 都必须明确为
+`DISABLED`。每次从共享缓存取出元数据后，仍会按调用者应用列级权限。只允许描述或选择当前获授权分析/仪表盘定义中图表字段井和
+可达控件出现的列；固定筛选依赖列只在策略内部使用。覆盖整个分析且可复现的分类、时间和数值筛选会 AND 到每次查询；局部工作表/
+图表、跨数据集、OR 或其他不支持的活动筛选会让查询拒绝执行。
 
-在数据库安全组里放行数据工具 Lambda（它的安全组、子网网段，或你通过 `securityGroupIds` 加上的组）。通过 VPC 对等连接访问
-其他区域的数据库也可以。
+数据 Lambda 始终验证数据库证书和主机名。`DisableSsl`、目标漂移、MySQL 服务端在认证前不支持 TLS，或已连接会话没有 TLS 都会在
+查询前拒绝。用 `databaseEgress` 精确列出数据库路由；栈自建安全组没有默认出口，只放行这些 CIDR/端口和 QuickSight、Secrets
+Manager、DynamoDB、RDS API 接口端点的 HTTPS。`createInterfaceEndpoints: true` 时栈会创建这四个端点，并让数据 Lambda 使用
+DynamoDB 和 RDS API 的端点专用 URL；为 `false` 时必须提供全部端点 CIDR、`dynamodbEndpointUrl` 和 `rdsEndpointUrl`。通过
+`securityGroupIds` 附加的安全组规则会叠加，不能带来 NAT、互联网或更宽的 VPC 出口。数据库安全组
+应放行栈自建的数据 Lambda 安全组；跨区域 VPC 对等连接也必须列出准确网段和端口。
 
 ### 6. 接入分析
 
@@ -653,8 +707,9 @@ GRANT SELECT ON <db>.<table> TO 'qsca_reader'@'%';
 或者直接在 QuickSight 控制台点 **发布**。浏览器不会告诉聊天窗口自己在哪个 QuickSight 页面，控制台发布又会原样复制分析里的
 聊天地址，所以每次发布仪表盘后（控制台或 API），EventBridge 规则会运行 `<prefix>-dashboard-publisher` Lambda：在新版本里给
 本方案的聊天地址加上 `where=dashboard` 并发布（约 20 秒，之后刷新仪表盘）。仪表盘里的聊天因此不提供修改（修改只作用于分析，
-不会改已发布的仪表盘），并提示到哪里修改。仪表盘还会打上来源分析的标签，只有仪表盘权限的用户仍可使用。`qsca publish` 一步
-完成同样的事。可选：建一个参数 `pViewer`，动态默认值为当前用户邮箱，聊天窗口可以借此发现同一浏览器里切换了 QuickSight 用户
+不会改已发布的仪表盘），并提示到哪里修改。经过验证的发布会在应用表写入绑定具体版本的 `dashboard#…` 来源记录；仪表盘标签
+只用于运维信息，从不参与授权。只有仪表盘权限的用户只读取该已发布仪表盘定义；同账号、同区域且完全匹配的 QuickSight
+`SourceEntityArn` 也可以独立证明来源。`qsca publish` 一步完成同样的事。可选：建一个参数 `pViewer`，动态默认值为当前用户邮箱，
 （不用于授权）。
 
 ### 7. 检查
@@ -670,14 +725,18 @@ python3 tests/e2e.py --profile <p> --analysis <id> --editor <email> [--other-edi
 ### 企业 MCP 服务器（可选）
 
 ```json
-"mcpTargets": [
+{
+  "mcpTargets": [
   {"name": "datahub", "endpoint": "https://mcphub.example.com/datahub/mcp",
    "auth": {"type": "oauth", "providerArn": "arn:aws-cn:bedrock-agentcore:cn-north-1:<acct>:token-vault/default/oauth2credentialprovider/datahub", "scopes": ["read"]}},
   {"name": "metabase", "endpoint": "https://mcphub.example.com/metabase/mcp",
    "auth": {"type": "apiKey", "providerArn": "arn:aws-cn:...:apikeycredentialprovider/metabase", "parameterName": "X-API-Key"}}
-]
+  ],
+  "enterpriseReadOnlyTools": ["datahub___search", "metabase___list_questions"]
+}
 ```
 
+只注册目标不会开放任何工具。请逐个确认工具为只读，并把准确 Gateway 名称加入 `enterpriseReadOnlyTools`；其余企业工具不会提供给模型。
 `auth.type`：`none`、`oauth` / `apiKey`（先创建 AgentCore Identity 凭证提供程序），或 `iam`（`service: "bedrock-agentcore"`、
 `runtimeArn`、可选 `region`，用于部署在 AgentCore Runtime 上的 MCP 服务器）。端点必须是公网 HTTPS（中国区的 Gateway 没有
 VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用户身份：只开放只读工具。
@@ -695,9 +754,14 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
   令牌会失效，用户重新提问即可）。
 - 数据库凭证只来自 `<datasourceSecretPrefix><DataSourceId>`（`./qsca datasource-secret`），并且必须是只能 SELECT 的用户；不再回退到
   QuickSight 数据源自己的密钥，`extraSecretArns` 也不再生效。`datasourceSecretPrefix` 必须是不含 `*` 或 `?` 的固定前缀，并且不能覆盖
-  `<prefix>/session-key`、`<prefix>/tool-key` 或 `<prefix>/model-config`（否则部署会拒绝），密钥也必须在栈所在的区域。
-- 内置查询拒绝自定义 SQL 数据集，并且只提供分析用到的列。
-- 浏览器把登录保存在 sessionStorage 里：每个浏览器标签页各登录一次；**退出** 还会取消这次登录正在运行的回答，分析工具也会拒绝它的工具令牌。
+  `<prefix>/session-key`、`<prefix>/tool-key`、`<prefix>/log-key` 或 `<prefix>/model-config`（否则部署会拒绝），密钥也必须在栈所在的区域。
+- 数据库凭证记录现在包含操作员批准的 QuickSight/RDS 目标和强制 TLS 标记。部署后要为每个数据源重新运行
+  `./qsca datasource-secret`；旧的只有用户名/密码的记录会拒绝使用。
+- 内置查询只有在两种 RLS 都明确关闭时才执行；按调用者应用列级权限，只提供获授权分析或仪表盘定义里的图表/控件列，并强制执行
+  可精确复现的全分析筛选。
+- 浏览器认证改为服务端不透明会话，由 `Secure; HttpOnly; SameSite=None` 的 `__Host-qsca-session` Cookie
+  引用。弹窗不会向页面脚本发送凭证；页面从 `/me` 读取身份和单独的 CSRF 令牌，每个已认证 POST 都必须携带该令牌。部署后旧的
+  浏览器 Bearer 会话会失效，用户需重新登录。**退出** 会删除不透明会话、吊销派生工具令牌并取消这次登录正在运行的回答。
 
 ## 使用
 
@@ -745,9 +809,9 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
    - *把“价格走势”改成柱状图* · *改成按月显示* · *改用电量的总和* · *按场站分组*
    - *按数值降序* · *标题改成……* · *新增一个按场站统计平均价格的表格* · *删除这个图表*
    - 每个请求都会显示 **预览**（用修改后的口径画出的图表或表格），并带 **应用到分析** / **不用了**。应用后请 **刷新页面**
-     （编辑界面不会自动刷新）。说 **撤销** 恢复最近一次已应用的修改（可连续撤销）。点 **应用到分析** 后，**发布到仪表盘**
-     （或直接发送“发布到仪表盘”）把分析的当前内容发布到由它发布、用户有权更新的仪表盘，并给聊天打上标记；刷新页面后按钮仍在。
-     修改只作用于分析；要更新仪表盘需重新发布。仪表盘里的聊天不提供修改。
+     （编辑界面不会自动刷新）。发送 **撤销** 或 **强制撤销** 只会生成确认提示，必须点击其中的按钮才会恢复修改。点
+     **发布到仪表盘** 才会发布；发送同样文字也只生成确认提示，绝不会直接发布。刷新页面后按钮仍在。修改只作用于分析；
+     要更新仪表盘需重新发布。仪表盘里的聊天不提供修改。
 4. **取消** 停止正在进行的回答；页面刷新后（如选择了控件值）会继续获取正在进行的回答。浏览器按用户和分析保存 8 小时内的对话。
 
 ## 安全
@@ -755,16 +819,16 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 | 方面 | 机制 |
 |---|---|
 | 登录 | 只有分配到 Identity Center 应用的用户；SAML 断言校验签名（逐一对照应用元数据里的每张签名证书，证书轮换期间也能登录）、颁发者、受众、ACS、请求 ID、有效期和重放；没有 ID 的断言拒绝 |
-| 会话 | 用 `session-key` 密钥（只有 web Lambda 能读取）以 HS256 签名的 JWT（PyJWT），默认 1 小时（`sessionSeconds`），保存在标签页的 sessionStorage 中；只有 web Lambda 接受；点 **退出** 会在服务端立即吊销，并取消它正在运行的回答 |
-| 聊天页 | Content-Security-Policy：脚本只能来自页面自己的来源（没有内联脚本，文件名带内容哈希），请求只能发往它的 API，不允许插件和表单提交，只能被 `frameAncestors` 嵌入；样式允许内联（ECharts 提示框需要）。页面用 DOM 节点构建界面（文本，从不拼 HTML 字符串）；Markdown 只经过一个 DOMPurify 净化边界，不允许图片、iframe、样式、class、`div` 和 `span` |
-| 谁能看数据 | 用户必须能查看该分析或由它发布的仪表盘；只能查询该分析的数据集。登录邮箱必须恰好对应一个活跃的 QuickSight 用户（有多个时拒绝，而不是合并） |
-| 数据集规则 | 启用了行级权限、数据集筛选、联接或自定义 SQL 的数据集拒绝查询（直接查源会绕过这些规则）；只提供分析用到的列；列级权限限制的列对未授权用户隐藏；使用专用的只读（SELECT）数据库用户 |
-| 查询 | 模型从不写 SQL：结构化请求，列名按数据集校验，固定的聚合与运算符，绑定参数，只读事务，20 秒超时，最多 500 行 |
+| 会话 | 浏览器只收到 `Secure; HttpOnly; SameSite=None; Path=/` 的 `__Host-qsca-session` Cookie 中的随机不透明 ID；声明和单独的 CSRF 令牌保存在 DynamoDB。`/me` 返回身份和 CSRF 令牌，每个已认证 POST 都必须校验它。默认有效 1 小时（`sessionSeconds`）。HS256 会话 JWT 路径仅为管理员 `qsca smoke` 保留；点 **退出** 会删除并吊销浏览器会话、取消正在运行的回答 |
+| 聊天页 | Content-Security-Policy：脚本只能来自页面自己的来源（没有内联脚本，文件名带内容哈希），请求只能发往它的 API，不允许插件和表单提交。`frameAncestors` 只接受不重复的准确 HTTPS 来源，不允许通配符、路径、凭证、查询或片段。样式允许内联声明（ECharts 提示框需要）。页面用 DOM 节点构建界面（文本，从不拼 HTML 字符串）；Markdown 只经过一个 DOMPurify 净化边界，不允许图片、iframe、样式、class、`div` 和 `span` |
+| 谁能看数据 | 用户要么有分析的 `DescribeAnalysis`，要么有具备准确 QuickSight 来源或版本绑定应用映射的仪表盘 `DescribeDashboard`。只有仪表盘权限的用户只得到已发布仪表盘定义，不能读取实时分析草稿；标签不参与授权。登录邮箱必须恰好对应一个活跃 QuickSight 用户 |
+| 数据集规则 | 数据集 RLS 和标签 RLS 都必须明确关闭；数据集筛选、联接和自定义 SQL 会拒绝。缓存后按调用者应用列级权限，只暴露图表/可达控件列，强制筛选列只在策略内部使用；凭证绑定到批准目标和经过验证的 TLS 会话 |
+| 查询 | 模型从不写 SQL：结构化请求、调用者可见列、固定聚合/运算符、绑定参数、只读事务、20 秒超时、最多 500 行。可复现的全分析筛选总是 AND 进去；不支持的活动作用域或筛选形状会拒绝 |
 | 沙箱 | Code Interpreter 为 SANDBOX 网络模式，没有执行角色：只拿到用户本来就能查询的结果行 |
 | 谁能修改 | 用户对该分析有 `quicksight:UpdateAnalysis`（QuickSight 共享）；只有发起人能在 10 分钟内应用一次；每次修改前都把原定义备份到 S3 |
 | 工具拿到的身份 | 工具永远拿不到浏览器的令牌。web Lambda 用单独的 `tool-key` 为每个任务签发一个工具令牌（绑定用户、分析和这次登录，有效期为 Runtime 会话的最长时长），为每次按钮点击签发 5 分钟的工具令牌；Runtime 在代码里把它附加到本方案自己的工具调用上；模型看不到也伪造不了；企业 MCP 服务器拿不到。工具 Lambda 拒绝会话令牌，也拒绝为其他分析签发的令牌；分析工具还会拒绝已退出登录的令牌 |
-| 权限变更 | QuickSight 用户、组和共享设置最多缓存 60 秒，所以撤销共享或移出组在一分钟内生效；“由分析发布的仪表盘”列表缓存 5 分钟（仪表盘改为从另一个分析发布后，它的查看者对旧分析的访问最多保留这么久） |
-| 数据流向 | 提问和结果发送到你的模型端点；CloudWatch 日志里不含令牌或密码，也不记录登录邮箱（改用不可逆的按用户标识）、SAML 属性或模型输出文本（仅记录长度/计数用于诊断）|
+| 权限变更 | QuickSight 用户、组和共享设置最多缓存 60 秒。仪表盘来源绑定具体版本；版本不符或已删除的映射由发布器移除，缓存期间也不能授权。Runtime 的 DynamoDB 写入只允许正好 32 字符的任务键，其他组件按操作和键命名空间限制 |
+| 数据流向 | 提问和结果发送到你的模型端点。分析元数据、控件值、浏览器历史和每个工具结果都会先移除控制/隐藏字符并限制大小，再放进每次运行随机的不可信数据边界，不进入 system role。企业工具只有准确名称在 `enterpriseReadOnlyTools` 中才会提供给模型。CloudWatch 日志不含令牌、密码、异常消息、SAML 属性或模型输出文本；用户引用是由专用生成日志密钥计算的 HMAC-SHA256 假名，诊断只记录大小、数量、异常类和关联 ID |
 
 SPICE 数据集：内置查询读取的是源数据的当前值，可能比上次 SPICE 刷新更新（回答里会说明）。
 
@@ -781,7 +845,7 @@ SPICE 数据集：内置查询读取的是源数据的当前值，可能比上�
 | 准确性 | 模型可能理解错问题、选错列或筛选条件，也可能描述错结果。图表和预览里的数字由代码从工具结果中读取，从不由模型填写，但周围的文字来自模型：重要的回答请对照分析核实 |
 | 透明 | 每个回答都会列出调用过的工具及参数，并显示模型名称和耗时；数据直接取自数据源而不是 SPICE 副本时，回答会说明 |
 | 人工把关 | 模型不能自己修改分析。修改先以预览展示（附带修改后会显示的数据），只有发起人点 **应用到分析** 后分析才会改变；修改前会先备份原定义，最近一次修改可以撤销 |
-| 不可信内容 | 数据集里的值、分析里的文字和企业 MCP 返回的结果，都可能夹带针对模型的指令（提示注入）。模型从不设置用户身份或分析，也从不写 SQL；它输出的 Markdown 不能加载图片或其他远程内容；权限由工具检查，而不是由模型决定 |
+| 不可信内容 | 数据集值、分析文字、URL 绑定控件、浏览器历史和企业 MCP 结果都可能夹带提示注入。Runtime 会在 JSON 解析前拒绝超过固定 UTF-8 原始字节上限或嵌套深度的工具响应，再以全局节点/深度预算清理容器和字符串，并把每类数据放在 system role 之外的随机不可信数据边界中。这能降低误执行风险，但不能证明模型会忽略所有注入。身份、分析和参数由代码注入；权限及企业工具名单由模型外部强制执行 |
 | 内容过滤 | 本示例没有配置 Amazon Bedrock Guardrails 或其他内容过滤：模型可以是任意 OpenAI 兼容端点，而 AWS 中国区没有 Amazon Bedrock。如果你的场景需要内容过滤，请在模型端点或网关上配置（例如在支持的区域使用 Amazon Bedrock 时启用 Bedrock Guardrails） |
 | 偏差 | 回答取决于分析里的数据和你所选模型的行为。本示例不对模型做偏差测试；请用你自己的用户和数据评估所配置的模型 |
 | 发送给模型的数据 | 提问、最近几轮对话、分析结构和查询结果会发送到你的模型端点（见上面的“数据流向”）；请选择数据使用条款符合你要求的端点 |
@@ -789,7 +853,7 @@ SPICE 数据集：内置查询读取的是源数据的当前值，可能比上�
 ## 成本
 
 按用量计费：AgentCore Runtime（活跃会话的 CPU / 内存时长）、Gateway 调用、Code Interpreter 会话、Lambda、API Gateway、
-按需 DynamoDB、Secrets Manager 密钥、**VPC 接口端点（2 个端点 × 子网数，按小时计费；通常是最大的固定成本）**、CloudWatch
+按需 DynamoDB、Secrets Manager 密钥、**VPC 接口端点（4 个端点 × 子网数，按小时计费；通常是最大的固定成本）**、CloudWatch
 Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
 
 ## 故障排查
@@ -821,7 +885,7 @@ Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
 ## 限制
 
 - 内置数据查询：PostgreSQL、Aurora PostgreSQL、MySQL、Aurora MySQL、MariaDB、RDS（PostgreSQL / MySQL）；只有一个关系表的
-  数据集，并且只能用分析用到的列。自定义 SQL 数据集、Athena、Redshift、S3 等不支持（请接入企业 MCP 服务器）。
+  数据集，并且只能使用获授权定义中调用者可见的图表字段和可达控件列。自定义 SQL 数据集、Athena、Redshift、S3 等不支持（请接入企业 MCP 服务器）。
 - 修改支持折线图、柱状图和表格（聚合字段井）；使用分节布局的工作表不能自动新增可视对象；被筛选或动作引用的可视对象拒绝删除。
 - 使用计算字段的可视对象，只有参数切换型字段（`ifelse(${p} = '…', {col}, …)`）能预览。
 - 聊天不能修改控件；应用修改后编辑界面不会自动刷新；编辑界面里未保存的手动修改与已应用的修改可能互相覆盖。
@@ -834,8 +898,12 @@ python3.12 -m venv ~/.venvs/qsca && ~/.venvs/qsca/bin/pip install signxml==5.2.0
 ACCOUNT_ID=0 SESSION_SECRET_ID=x TOOL_SECRET_ID=y QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-north-1 ~/.venvs/qsca/bin/python -m unittest discover -s tests/unit
 (cd infra && npm ci && npx tsc --noEmit && npm test)   # npm test：配置校验
 (cd tests/js && npm ci && npm test)   # 在 jsdom 里测试聊天页的渲染（仅开发用）
-./qsca build
+~/.venvs/qsca/bin/python ./qsca build
 ```
+
+`qsca build` 只从已提交的 `requirements/*.txt` 完整传递依赖锁中安装各部署包，并使用
+`--require-hashes --no-deps`；依赖缓存标记由锁文件内容计算。构建还会核对两个 AWS 中国区 RDS CA 下载文件的固定 SHA-256。
+依赖变化时，同时更新对应的 `requirements/*.in`，重新生成并审核完整哈希锁，不能只手改直接依赖版本。
 
 单元测试需要 `boto3` 和 `PyJWT`；`tests/unit/test_auth.py` 里的 SAML 和退出登录测试还需要下面固定版本的 `signxml`、`lxml` 和
 `cryptography`（没有时跳过；上面的 venv 里都有）。

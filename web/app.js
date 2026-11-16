@@ -3,13 +3,15 @@ const params = new URLSearchParams(location.search);
 const ANALYSIS = /^[\w-]{1,512}$/.test(params.get("analysis") || "") ? params.get("analysis") : "";
 // where=dashboard is added by `qsca publish`: the published dashboard does not change when the analysis is edited.
 const IN_DASHBOARD = params.get("where") === "dashboard";
-// QuickSight substitutes <<$param>>; unset or "select all" values (localized, e.g. "全部") mean "no filter".
+// QuickSight substitutes <<$param>>; preserve Select All distinctly from unset or unsubstituted values.
 const ALL_VALUES = /^(\[?all( values)?\]?|select all|null|undefined|全部|全选|所有|全部值)$/i;
+const SELECT_ALL_VALUE = "all";
 const pad = (n) => String(n).padStart(2, "0");
 const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
 function cleanValue(v) {
   v = (v || "").trim();
-  if (!v || v.startsWith("<<") || ALL_VALUES.test(v)) return "";
+  if (!v || v.startsWith("<<")) return "";
+  if (ALL_VALUES.test(v)) return SELECT_ALL_VALUE;
   // Date parameters arrive as e.g. "Thu Jan 01 2026 00:00:00 GMT 0000" (the "+" becomes a space): keep the calendar date.
   const text = v.match(/^(?:[A-Za-z]{3},?\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})\s+\d{2}:\d{2}/);
   if (text && MONTHS[text[1].toLowerCase()]) return `${text[3]}-${pad(MONTHS[text[1].toLowerCase()])}-${pad(text[2])}`;
@@ -27,7 +29,7 @@ for (const [key, value] of params) {
 // detects that the stored chat session belongs to someone else after a QuickSight user switch in this browser.
 const VIEWER = (() => { const v = cleanValue(params.get("viewer")).toLowerCase(); return /^[^\s@]+@[^\s@]+$/.test(v) ? v : ""; })();
 const PREFIX = "qsca:";
-const AUTH_KEY = PREFIX + "auth";
+const LEGACY_AUTH_KEY = PREFIX + "auth";
 const chatKey = () => (auth ? `${PREFIX}history:${auth.user.sub}:${ANALYSIS}` : "");
 const pendingKey = () => (auth ? `${PREFIX}pending:${auth.user.sub}:${ANALYSIS}` : "");
 const SESSION_KEY = PREFIX + "session:" + ANALYSIS;
@@ -53,36 +55,25 @@ function addMessage(role, content, extra = "") {
   return div;
 }
 
-// ---- Sign-in: IAM Identity Center (SAML) in a popup; the session token lives in this tab's sessionStorage for 1 hour
-// (the deployment's sessionSeconds), so it is gone when the tab closes and each tab signs in on its own. When it
-// expires the conversation stays (localStorage): sign in again and it continues. ----
+// ---- Sign-in: the browser receives only an opaque HttpOnly cookie. /me returns identity and the CSRF token used
+// on mutations. Conversation storage is not opened until /me has identified its owner. ----
 let auth = null;
 let mismatchNotice = "";
-try { localStorage.removeItem(AUTH_KEY); } catch {}  // older versions kept the token in localStorage
-try {
-  const saved = JSON.parse(sessionStorage.getItem(AUTH_KEY) || "null");
-  if (saved && saved.token && saved.user && saved.user.exp * 1000 > Date.now() + 60000) auth = saved;
-} catch {}
+try { localStorage.removeItem(LEGACY_AUTH_KEY); } catch {}  // remove tokens left by older releases
+try { sessionStorage.removeItem(LEGACY_AUTH_KEY); } catch {}
 function clearStored() {
-  try { sessionStorage.removeItem(AUTH_KEY); } catch {}
+  try { sessionStorage.removeItem(LEGACY_AUTH_KEY); } catch {}
   for (const key of Object.keys(localStorage)) if (key.startsWith(PREFIX)) localStorage.removeItem(key);
 }
-// Sign-out revokes the token on the server too, so a copy of it (e.g. taken from this storage) stops working.
-function revoke(token) {
-  if (!token) return;
-  fetch("/auth/logout", { method: "POST", keepalive: true, headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
-}
-if (auth && VIEWER && auth.user.sub !== VIEWER) {
-  mismatchNotice = `QuickSight 当前用户已切换为 ${VIEWER}，之前 ${auth.user.sub} 的聊天会话和记录已清除，请重新登录。`;
-  revoke(auth.token);
-  clearStored();
-  auth = null;
+function revoke(signedIn) {
+  if (!signedIn) return;
+  fetch("/auth/logout", { method: "POST", keepalive: true, credentials: "include",
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": signedIn.csrf } }).catch(() => {});
 }
 function sessionExpired() { return !auth || auth.user.exp * 1000 <= Date.now() + 30000; }
-// Expiry (or a 401): forget only the token; this user's conversation and a running answer are picked up after sign-in.
+// Expiry (or a 401): forget browser-readable identity and CSRF state; the cookie itself is HttpOnly.
 function expire(message) {
   auth = null;
-  try { sessionStorage.removeItem(AUTH_KEY); } catch {}
   renderWho();
   showLogin(message || "登录已过期，请重新登录，对话会接着进行。");
 }
@@ -104,13 +95,31 @@ function renderWho() {
   byId("who").append(name, out);
 }
 function signOut(message) {
-  if (auth) revoke(auth.token);
+  const signedIn = auth;
   auth = null;
+  revoke(signedIn);
   clearStored();
   history.length = 0;
   for (const node of [...byId("log").querySelectorAll(".msg:not(.login)")]) node.remove();
   renderWho();
   showLogin(message);
+}
+async function acceptIdentity(identity, restore) {
+  if (!identity || !identity.sub || !identity.exp || !identity.csrf) throw new Error("登录状态无效");
+  auth = { user: { sub: identity.sub, name: identity.name, exp: identity.exp }, csrf: identity.csrf };
+  if (VIEWER && auth.user.sub !== VIEWER) {
+    mismatchNotice = `QuickSight 当前用户已切换为 ${VIEWER}，之前 ${auth.user.sub} 的聊天会话和记录已清除，请重新登录。`;
+    signOut(mismatchNotice);
+    return;
+  }
+  if (loginBox) { loginBox.remove(); loginBox = null; }
+  history.length = 0;
+  byId("log").replaceChildren();
+  renderWho(); startSession(restore); byId("q").focus();
+}
+async function bootstrapIdentity(restore) {
+  try { await acceptIdentity(await api("/me"), restore); }
+  catch (error) { if (!auth) showLogin(mismatchNotice || (error.expired ? undefined : error.message)); }
 }
 // Example questions, one group per capability. A deployment can replace them (config.json "examples").
 // Built-in default: one question that works for any analysis. Each analysis gets its own set from its editors
@@ -285,20 +294,10 @@ function startLogin() {
   const onMessage = (event) => {
     if (event.origin !== location.origin || event.source !== popup) return;
     const data = event.data || {};
-    if (data.type !== "qsca-auth" || data.nonce !== nonce || !data.token) return;
+    if (data.type !== "qsca-auth" || data.nonce !== nonce) return;
     done = true;
     window.removeEventListener("message", onMessage);
-    if (VIEWER && data.user.sub !== VIEWER) {
-      note.textContent = `登录的 Identity Center 账号是 ${data.user.sub}，但 QuickSight 当前用户是 ${VIEWER}。请在 Identity Center 门户注销后，用 ${VIEWER} 重新登录。`;
-      return;
-    }
-    auth = { token: data.token, user: data.user };
-    sessionStorage.setItem(AUTH_KEY, JSON.stringify(auth));
-    if (loginBox) { loginBox.remove(); loginBox = null; }
-    // Redraw from this browser's saved conversation (also after an expiry) and pick up an answer still running.
-    history.length = 0;
-    byId("log").replaceChildren();
-    renderWho(); startSession(true); byId("q").focus();
+    bootstrapIdentity(true).catch(() => {});
   };
   window.addEventListener("message", onMessage);
   const watch = setInterval(() => {
@@ -476,7 +475,10 @@ function loadHistory() {
   return [];
 }
 async function api(path, options = {}) {
-  const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${auth.token}` } : {}), ...(options.headers || {}) } });
+  const method = (options.method || "GET").toUpperCase();
+  const csrf = auth && method === "POST" ? { "X-CSRF-Token": auth.csrf } : {};
+  const res = await fetch(path, { ...options, credentials: "include",
+    headers: { "Content-Type": "application/json", ...csrf, ...(options.headers || {}) } });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) {
     if (auth) expire();
@@ -487,10 +489,47 @@ async function api(path, options = {}) {
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
+function confirmationNode(action, turn) {
+  if (!action || !["publish_dashboards", "undo_last_visual_change"].includes(action.type)) return null;
+  if (action.status === "cancelled") return el("div", { class: "box off" }, "已取消，未执行操作。");
+  if (action.status === "done") return el("div", { class: "box done" }, "✓ " + (action.note || "操作已完成。"));
+  const force = action.type === "undo_last_visual_change" && action.force === true;
+  const text = action.type === "publish_dashboards" ? "确认把分析的当前内容发布到相关仪表盘吗？"
+    : force ? "确认强制撤销吗？这会覆盖最近一次助手修改之后的其他编辑。" : "确认撤销最近一次由助手应用的修改吗？";
+  const confirm = el("button", { type: "button", class: "primary confirm-action" },
+    action.type === "publish_dashboards" ? "确认发布" : force ? "确认强制撤销" : "确认撤销");
+  const cancelButton = el("button", { type: "button", class: "cancel-action" }, "不用了");
+  const box = el("div", { class: "box confirmation" }, el("p", null, text), confirm, cancelButton);
+  const replace = () => { saveHistory(); box.replaceWith(confirmationNode(action, turn)); };
+  cancelButton.onclick = () => { action.status = "cancelled"; replace(); };
+  confirm.onclick = async () => {
+    confirm.disabled = true; confirm.textContent = "正在执行…";
+    try {
+      if (action.type === "publish_dashboards") {
+        const result = await api("/dashboards/publish", { method: "POST", body: JSON.stringify({ analysis: ANALYSIS }) });
+        const names = (result.published || []).map((d) => `“${d.name}”（第 ${d.version} 版）`).join("、");
+        action.note = `已发布到仪表盘 ${names}。打开仪表盘后刷新即可看到。`;
+      } else {
+        const result = await api("/changes/undo", { method: "POST",
+          body: JSON.stringify({ analysis: ANALYSIS, force }) });
+        action.note = `已撤销：${result.undid || "最近一次修改"}。请手动刷新页面查看。`;
+      }
+      action.status = "done"; replace();
+    } catch (error) {
+      confirm.disabled = false;
+      confirm.textContent = action.type === "publish_dashboards" ? "确认发布" : force ? "确认强制撤销" : "确认撤销";
+      let note = box.querySelector(".note.err");
+      if (!note) { note = el("p", { class: "note err" }); box.append(note); }
+      note.textContent = `没有执行：${error.message}`;
+    }
+  };
+  return box;
+}
 function answerNode(turn) {
   const steps = (turn.steps || []).map((s) => el("li", null, s.ok ? "✓" : "✕", " ", el("code", null, s.tool), " ", JSON.stringify(s.arguments)));
   const stats = turn.totalMs ? " · " + (turn.totalMs / 1000).toFixed(1) + " 秒 · " + (turn.model || "") : "";
   return fragment(markdown(turn.content || "（无回答）"), chartsNodes(turn.charts, turn), controlsNode(turn.controls),
+    (turn.actions || []).map((action) => confirmationNode(action, turn)),
     steps.length ? el("details", { class: "steps" }, el("summary", null, "工具调用 " + turn.steps.length + " 次" + stats), el("ul", null, steps)) : null);
 }
 async function ask(prompt, resumeJob) {
@@ -527,7 +566,8 @@ async function ask(prompt, resumeJob) {
     if (result.status === "CANCELLED") { pending.className = "msg bot cancelled"; pending.textContent = "已取消"; return; }
     if (result.status !== "SUCCEEDED") throw new Error(result.error || "任务失败");
     const turn = { role: "assistant", content: result.answer || "", charts: result.charts || null, controls: result.controls || null,
-                   steps: result.steps || [], totalMs: result.totalMs, model: result.model, changes: {} };
+                   actions: result.actions || [], steps: result.steps || [], totalMs: result.totalMs, model: result.model,
+                   changes: {} };
     pending.replaceChildren(answerNode(turn));
     mountCharts(pending, turn.charts, turn);
     history.push({ role: "user", content: prompt }, turn);
@@ -639,4 +679,4 @@ async function checkBinding() {  // parameters added or removed since binding: o
     button.onclick = () => bindTo(box, button, ANALYSIS);
   } catch {}  // no view permission or a transient error: the chat works as before
 }
-if (auth) { renderWho(); startSession(true); } else { showLogin(mismatchNotice || undefined); }
+bootstrapIdentity(true);

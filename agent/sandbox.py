@@ -12,10 +12,13 @@ import os
 
 import boto3
 
+import logging_utils
+
 CODE_INTERPRETER_ID = os.environ.get("CODE_INTERPRETER_ID", "")
 MAX_ROWS_IN = 5000
 MAX_ROWS_OUT = 500
 OUTPUT_LIMIT = 3000
+STRING_LIMIT = 2000
 RESULT_MARKER = "__QSCA_RESULT__"
 EPILOGUE = f"""
 import json as _qsca_json
@@ -37,13 +40,23 @@ class SandboxError(Exception):
     pass
 
 
+def _bounded(value):
+    if isinstance(value, str):
+        return value[:STRING_LIMIT]
+    if isinstance(value, dict):
+        return {str(key)[:STRING_LIMIT]: _bounded(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_bounded(item) for item in value]
+    return value
+
+
 def to_csv(rows):
     fields = list(dict.fromkeys(k for r in rows[:MAX_ROWS_IN] for k in r))
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for row in rows[:MAX_ROWS_IN]:
-        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+        writer.writerow({k: ("" if v is None else _bounded(v)) for k, v in row.items()})
     return buffer.getvalue()
 
 
@@ -96,7 +109,7 @@ class Sandbox:
             for line in captured["stdout"].splitlines():
                 if line.startswith(RESULT_MARKER):
                     rows = json.loads(line[len(RESULT_MARKER):])
-        return {"rows": rows, "stdout": stdout[-OUTPUT_LIMIT:], "stderr": ran["stderr"][-OUTPUT_LIMIT:],
+        return {"rows": _bounded(rows), "stdout": stdout[-OUTPUT_LIMIT:], "stderr": ran["stderr"][-OUTPUT_LIMIT:],
                 "ok": not (ran["exitCode"] or ran["isError"])}
 
     def close(self):
@@ -105,5 +118,6 @@ class Sandbox:
                 self.client.stop_code_interpreter_session(codeInterpreterIdentifier=CODE_INTERPRETER_ID,
                                                           sessionId=self.session_id)
             except Exception as error:  # noqa: BLE001 - the session also times out by itself
-                print(json.dumps({"event": "code_interpreter_stop_failed", "error": repr(error)[:200]}))
+                print(json.dumps({"event": "code_interpreter_stop_failed",
+                                  **logging_utils.exception_fields(error)}))
             self.session_id = None

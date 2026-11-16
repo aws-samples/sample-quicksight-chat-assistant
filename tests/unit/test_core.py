@@ -189,8 +189,12 @@ class DatasetPlanTest(unittest.TestCase):
 
     def test_column_level_security_hides_columns_for_others(self):
         rules = [{"Principals": ["arn:user/boss"], "ColumnNames": ["secret"]}]
-        self.assertNotIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/a"])["columns"])
-        self.assertIn("secret", ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/boss"])["columns"])
+        viewer = ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/a"])
+        boss = ds.plan(dataset_body(ColumnLevelPermissionRules=rules), ["arn:user/boss"])
+        self.assertNotIn("secret", viewer["columns"])
+        self.assertNotIn("secret", viewer["_policy_columns"])
+        self.assertIn("secret", boss["columns"])
+        self.assertIn("secret", boss["_policy_columns"])
 
     def test_custom_sql_is_unsupported(self):
         custom = dataset_body(PhysicalTableMap={"p1": {"CustomSql": {"DataSourceArn": "arn:ds/s1", "Name": "q",
@@ -203,7 +207,7 @@ class DatasetPlanTest(unittest.TestCase):
         plan = ds.plan(dataset_body(), ["arn:user/a"], referenced={"station"})
         self.assertEqual(list(plan["columns"]), ["station"])
         self.assertEqual(plan["hidden"], [])  # unreferenced columns are not even named
-        self.assertIn("只列出分析里用到的列", plan["notes"])
+        self.assertIn("只列出当前查看资源的图表或可用控件列", plan["notes"])
         self.assertEqual(set(ds.plan(dataset_body(), [])["columns"]), {"station", "price", "secret"})
 
     def test_connection_parameters(self):
@@ -250,11 +254,48 @@ def analysis_definition():
 class DefinitionTest(unittest.TestCase):
     def test_parameters_controls_and_filters(self):
         d = analysis_definition()
+        d["ParameterDeclarations"].extend([
+            {"StringParameterDeclaration": {"Name": "pMulti", "ParameterValueType": "MULTI_VALUED",
+                                             "DefaultValues": {"StaticValues": ["A", "B"]}}},
+            {"StringParameterDeclaration": {"Name": "pHidden", "ParameterValueType": "SINGLE_VALUED",
+                                             "DefaultValues": {"StaticValues": ["SAFE"]}}},
+        ])
+        station_control = d["Sheets"][0]["ParameterControls"][0]["Dropdown"]["SelectableValues"]
+        station_control["Values"] = ["ST1", "ST2"]
+        d["ParameterDeclarations"][0]["StringParameterDeclaration"]["DefaultValues"] = {"StaticValues": ["ST2"]}
+        d["FilterGroups"][0]["ScopeConfiguration"] = {"AllSheets": {}}
+        d["FilterGroups"][0]["Filters"].append({"CategoryFilter": {
+            "FilterId": "hidden", "Column": {"DataSetIdentifier": "trade", "ColumnName": "secret"},
+            "Configuration": {"CustomFilterConfiguration": {"MatchOperator": "EQUALS",
+                                                                "ParameterName": "pHidden",
+                                                                "NullOption": "NON_NULLS_ONLY"}}}})
         self.assertEqual(defs.parameters(d)["pStation"]["control"], "场站")
         self.assertEqual(defs.parameters(d)["pStation"]["values_from"], {"dataset": "trade", "column": "station"})
+        self.assertEqual(defs.parameters(d)["pMulti"]["default"], ["A", "B"])
         bindings = defs.parameter_filters(d)
         self.assertEqual(bindings[0]["column"], "station")
         self.assertEqual(bindings[0]["roles"], [{"op": "eq", "parameter": "pStation"}])
+        mandatory = defs.mandatory_filters(d, "d1", {"pStation": "ST1", "pHidden": "all"})
+        self.assertEqual(mandatory, [{"column": "station", "op": "eq", "value": "ST1"},
+                                     {"column": "secret", "op": "eq", "value": "SAFE"}])
+        self.assertEqual(defs.mandatory_filters(d, "d1", {"pStation": ""}),
+                         [{"column": "station", "op": "eq", "value": "ST2"},
+                          {"column": "secret", "op": "eq", "value": "SAFE"}])
+        retained = defs.mandatory_filters(d, "d1", {"pStation": "all"})
+        self.assertEqual(retained, [{"column": "station", "op": "eq", "value": "ST2"},
+                                    {"column": "secret", "op": "eq", "value": "SAFE"}])
+        d["Sheets"][0]["ParameterControls"][0]["Dropdown"]["DisplayOptions"] = {
+            "SelectAllOptions": {"Visibility": "VISIBLE"}}
+        self.assertEqual(defs.mandatory_filters(d, "d1", {"pStation": "all"}),
+                         [{"column": "station", "op": "not_null"},
+                          {"column": "secret", "op": "eq", "value": "SAFE"}])
+        preview = defs.preview_query(d, "v1", {"pMetric": "价格", "pStation": "ST1"})["query"]
+        self.assertEqual(preview["metrics"], [{"column": "price", "agg": "avg"}])
+        self.assertEqual(preview["filters"], [])  # whole-analysis predicates are added only by the data tool
+        with self.assertRaises(defs.DefinitionUnsupported):
+            defs.mandatory_filters(d, "d1", {"pStation": "not-a-choice"})
+        with self.assertRaises(defs.DefinitionUnsupported):
+            defs.mandatory_filters(d, "d1", {"pStation": ["ST1"]})
 
     def test_preview_query_resolves_metric_switch_and_applies_controls(self):
         result = defs.preview_query(analysis_definition(), "v1", {"pMetric": "电量", "pStation": "ST1"})
@@ -307,9 +348,13 @@ class DefinitionTest(unittest.TestCase):
         self.assertNotIn("secret", plan["columns"])
 
     def test_model_view(self):
-        view = defs.strip_for_model(analysis_definition())
+        view = defs.strip_for_model(analysis_definition(), {"trade": {"station", "t"}})
         self.assertEqual(view["datasets"], {"trade": "d1"})
-        self.assertEqual([v["visual_id"] for v in view["sheets"][0]["visuals"]], ["v1", "v2", "v3"])
+        fields = [field for visual in view["sheets"][0]["visuals"]
+                  for key in ("dimensions", "measures", "colors") for field in visual[key]]
+        self.assertEqual(([v["visual_id"] for v in view["sheets"][0]["visuals"]], set(view["parameters"]),
+                          all(value not in str(fields) for value in ("picked", "price", "elec"))),
+                         (["v1", "v2", "v3"], {"pStation"}, True))
 
 
 def _data_handler():
@@ -338,7 +383,7 @@ class DataHandlerTest(unittest.TestCase):
                 return {"SecretString": '{"username": "reader", "password": "p"}'}
         source = {"DataSourceId": "s1", "SecretArn": "arn:aws-cn:secretsmanager:cn-north-1:1:secret:qs-owned"}
         with mock.patch.object(self.data.boto3, "client", lambda *a, **k: Secrets()):
-            self.assertEqual(self.data._secret(source), ("reader", "p"))
+            self.assertEqual(self.data._secret(source), {"username": "reader", "password": "p"})
             with self.assertRaisesRegex(self.data.ToolError, "datasource-secret s2"):
                 self.data._secret({**source, "DataSourceId": "s2"})
         self.assertEqual(asked, ["quicksight-chat-assistant/datasource/s1", "quicksight-chat-assistant/datasource/s2"])
@@ -351,13 +396,28 @@ class DataHandlerTest(unittest.TestCase):
             def describe_data_set(self, **_):
                 return {"DataSet": dataset_body()}
         caller = self.data.caller
-        with mock.patch.object(caller, "require_viewer", lambda args: ("a@example.com", "a1")), \
+        seen = []
+        with mock.patch.object(caller, "require_viewer", lambda args: ("a@example.com", "a1", None)), \
+                mock.patch.object(caller, "viewer_definition", lambda aid, dashboard: ("A", analysis_definition())), \
                 mock.patch.object(caller, "cached", lambda key, loader, seconds=60: loader()), \
                 mock.patch.object(caller, "principals", lambda email: {"arn:user/a"}), \
+                mock.patch.object(caller, "_tool_key", lambda: b"k" * 32), \
+                mock.patch.object(self.data, "_execute", lambda plan, spec: seen.append((plan, spec)) or
+                                  {"row_count": 0, "elapsed_ms": 0}), \
                 mock.patch.object(self.data, "qs", QuickSight()):
             out = self.data.describe_dataset({"dataset_id": "d1", "_caller": "t", "_analysis": "a1"})
-        self.assertEqual([c["name"] for c in out["columns"]], ["price", "station"])  # not "secret"
+            preview = defs.preview_query(analysis_definition(), "v1", {"pMetric": "价格", "pStation": "全部"})["query"]
+            preview["dataset_id"] = "d1"
+            preview.pop("dataset")
+            preview["_preview_capability"] = caller.mint_preview_capability(
+                "a@example.com", "a1", {k: v for k, v in preview.items() if k != "_preview_capability"})
+            self.data.query_dataset({**preview, "_caller": "t", "_analysis": "a1", "_parameters": {}})
+            with self.assertRaisesRegex(self.data.ToolError, "不匹配"):
+                self.data.query_dataset({**preview, "dimensions": ["price"], "_caller": "t", "_analysis": "a1"})
+        self.assertEqual([c["name"] for c in out["columns"]], ["station"])
         self.assertNotIn("secret", out["hidden_columns"])
+        self.assertIn("price", seen[0][0]["columns"])  # exact signed preview metric only
+        self.assertNotIn("secret", seen[0][0]["columns"])
 
     def test_query_refuses_unknown_top_level_keys(self):
         envelope = {"dataset_id": "d1", "_caller": "t", "_analysis": "a1", "_parameters": {}}
@@ -370,6 +430,23 @@ class DataHandlerTest(unittest.TestCase):
                 mock.patch.object(self.data, "_execute", lambda plan, s: seen.append(s) or {"row_count": 0, "elapsed_ms": 0}):
             self.assertEqual(self.data.handler({"__tool": "query_dataset", **envelope, **spec}, None)["row_count"], 0)
         self.assertEqual({k: v for k, v in seen[0].items() if v is not None}, spec)
+
+        policy_definition = {
+            "DataSetIdentifierDeclarations": [{"Identifier": "trade", "DataSetArn": "arn:dataset/d1"}],
+            "FilterGroups": [{"Status": "ENABLED", "CrossDataset": "SINGLE_DATASET", "Operator": "AND",
+                              "ScopeConfiguration": {"AllSheets": {}}, "Filters": [{"CategoryFilter": {
+                                  "Column": {"DataSetIdentifier": "trade", "ColumnName": "secret"},
+                                  "Configuration": {"CustomFilterConfiguration": {"CategoryValue": "SAFE",
+                                                                                    "MatchOperator": "EQUALS",
+                                                                                    "NullOption": "NON_NULLS_ONLY"}}}}]}],
+        }
+        denied_plan = {"_definition": policy_definition, "_dataset_id": "d1", "_parameters": {},
+                       "_policy_columns": {"station": COLUMNS["station"]}, "columns": {"station": COLUMNS["station"]},
+                       "data_source_arn": "arn:ds/s1", "source": TABLE}
+        with mock.patch.object(self.data, "_dataset", return_value=({"DataSetId": "d1"}, denied_plan)), \
+                mock.patch.object(self.data, "_connect", side_effect=AssertionError("must fail before database access")):
+            out = self.data.handler({"__tool": "query_dataset", **envelope, **spec}, None)
+        self.assertIn("当前用户无权访问的列", out["error"])
 
 
 class ChartsTest(unittest.TestCase):

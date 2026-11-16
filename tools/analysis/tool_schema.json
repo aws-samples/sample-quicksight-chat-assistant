@@ -38,19 +38,5 @@
       },
       "required": ["operation"]
     }
-  },
-  {
-    "name": "undo_last_visual_change",
-    "description": "Undo the most recent applied change to this analysis by restoring the definition saved before it. Refuses when the analysis was edited again afterwards, unless force is true (only when the user explicitly asks, e.g. 强制撤销).",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "force": {"type": "boolean", "description": "Overwrite later edits too. Only when the user explicitly says so."},
-        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
-        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."},
-        "_parameters": {"type": "object", "description": "Filled in by the system. Never set it."}
-      },
-      "required": []
-    }
   }
 ]

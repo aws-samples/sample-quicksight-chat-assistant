@@ -5,14 +5,15 @@ Routes:
   GET  /static/<file>          render.js, app.js and the vendored ECharts / marked / DOMPurify, versioned names,
                                cached for a year
   GET  /auth/login             start IAM Identity Center SAML login (popup)
-  POST /saml/acs               SAML assertion consumer; hands a session token (1 hour by default) to the iframe
-  POST /auth/logout            sign out: revoke this session token and cancel its running answers
-  GET  /me                     who is signed in
+  POST /saml/acs               SAML assertion consumer; sets an opaque HttpOnly browser-session cookie
+  POST /auth/logout            sign out: revoke this browser session and cancel its running answers
+  GET  /me                     who is signed in and the browser session's CSRF token
   POST /chat                   submit a question: stored as a job, sent to the Runtime, which acknowledges at once
   GET  /jobs/{id}              job status, progress and result (STALLED when heartbeats stop)
   POST /jobs/{id}/cancel       cancel a running job
   POST /changes/{id}/apply     the 应用到分析 button: apply a previewed analysis change as this user
-  POST /dashboards/publish     the 发布到仪表盘 button: publish the analysis to its dashboards as this user
+  POST /changes/undo           the confirmed 撤销 button: restore the latest saved analysis definition
+  POST /dashboards/publish     the confirmed 发布到仪表盘 button: publish to this analysis' dashboards
   GET  /bindable               an unbound chat visual: analyses this user may bind it to
   GET  /binding?analysis=ID    the analysis' current parameters (the page checks its URL is up to date)
   POST /bind                   the 绑定 / 更新绑定 button: point the chat visual(s) in the analysis at it
@@ -35,6 +36,7 @@ import boto3
 from botocore.config import Config
 
 import auth
+import logging_utils
 
 RUNTIME_ARN = os.environ["RUNTIME_ARN"]
 RUNTIME_VERSION = os.environ.get("RUNTIME_VERSION", "0")
@@ -43,7 +45,10 @@ ANALYSIS_TOOLS_FN = os.environ["ANALYSIS_TOOLS_FN"]
 # The ACS URL registered in Identity Center. Default: this API's own address (known only per request, which avoids a
 # deployment cycle between the Lambda and the HTTP API); set SAML_ACS_URL when serving through a custom domain.
 ACS_OVERRIDE = os.environ.get("SAML_ACS_URL", "")
-FRAME_ANCESTORS = os.environ.get("FRAME_ANCESTORS", "https://*.quicksight.amazonaws.cn https://*.amazonaws.cn")
+FRAME_ANCESTORS = os.environ.get("FRAME_ANCESTORS", "https://cn-north-1.quicksight.amazonaws.cn")
+BROWSER_COOKIE = "__Host-qsca-session"
+CSRF_HEADER = "x-csrf-token"
+EXAMPLES_BODY_BYTES = 25_000
 SESSION_ID = re.compile(r"^[A-Za-z0-9-]{33,100}$")
 ANALYSIS_ID = re.compile(r"^[\w-]{1,512}$")
 NONCE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -108,22 +113,8 @@ def popup_headers(nonce=None):
 
 
 def _uref(sub):
-    """Non-reversible short reference for a user, for logs only. Keeps per-user
-    correlation in CloudWatch without writing the sign-in email (PII) to logs."""
-    return "u_" + hashlib.sha256((sub or "").encode("utf-8")).hexdigest()[:12]
-
-
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-
-def _safe_err(text):
-    """Redact email addresses from a tool-error string before it is logged.
-    Analysis/data tools build some errors with the user's email (e.g.
-    '<email> 没有编辑这个分析的权限'); the user still sees the full message in the
-    response, but the email must not reach CloudWatch."""
-    if not isinstance(text, str):
-        return text
-    return _EMAIL_RE.sub("<redacted-email>", text)
+    """Keyed deployment-wide user pseudonym for logs."""
+    return logging_utils.uref(sub)
 
 
 def respond(status, body, headers=None):
@@ -132,24 +123,65 @@ def respond(status, body, headers=None):
             "body": body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)}
 
 
-def raw_body(event):
+def raw_body(event, max_bytes=None):
     body = event.get("body") or ""
-    return base64.b64decode(body).decode("utf-8") if event.get("isBase64Encoded") else body
+    if max_bytes is not None:
+        if event.get("isBase64Encoded"):
+            if len(body) > 4 * ((max_bytes + 2) // 3):
+                raise ValueError("request body too large")
+        elif len(body.encode("utf-8")) > max_bytes:
+            raise ValueError("request body too large")
+    decoded = base64.b64decode(body).decode("utf-8") if event.get("isBase64Encoded") else body
+    if max_bytes is not None and len(decoded.encode("utf-8")) > max_bytes:
+        raise ValueError("request body too large")
+    return decoded
 
 
-def request_json(event):
-    return json.loads(raw_body(event) or "{}")
+def request_json(event, max_bytes=None):
+    return json.loads(raw_body(event, max_bytes) or "{}")
+
+
+def header(event, name):
+    wanted = name.lower()
+    return next((str(value) for key, value in (event.get("headers") or {}).items() if key.lower() == wanted), "")
 
 
 def bearer(event):
-    header = (event.get("headers") or {}).get("authorization", "")
-    return header[7:].strip() if header[:7].lower() == "bearer " else ""
+    value = header(event, "authorization")
+    return value[7:].strip() if value[:7].lower() == "bearer " else ""
+
+
+def browser_cookie(event):
+    values = list(event.get("cookies") or [])
+    value = header(event, "cookie")
+    if value:
+        values.append(value)
+    for cookie_line in values:
+        for part in cookie_line.split(";"):
+            name, separator, cookie_value = part.strip().partition("=")
+            if separator and name == BROWSER_COOKIE:
+                return cookie_value
+    return ""
 
 
 def current_user(event):
-    """The claims of the request's session token (not revoked), or None."""
+    """Return claims from an opaque browser session, or from the signed bearer retained for qsca smoke."""
+    session_id = browser_cookie(event)
+    if session_id:
+        claims = auth.verify_browser_session(session_id, jobs)
+        if claims:
+            return {**claims, "_auth_type": "browser", "_browser_session": session_id}
     token = bearer(event)
-    return auth.verify_session(token, jobs) if token else None
+    claims = auth.verify_session(token, jobs) if token else None
+    return {**claims, "_auth_type": "bearer"} if claims else None
+
+
+def csrf_matches(event, user):
+    return user.get("_auth_type") != "browser" or secrets.compare_digest(header(event, CSRF_HEADER), user.get("csrf") or "")
+
+
+def session_cookie(value, max_age):
+    return f"{BROWSER_COOKIE}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=None"
 
 
 def acs_url(event):
@@ -161,7 +193,7 @@ def origin(event):
 
 
 def popup(status, title, message, payload=None, target_origin=""):
-    """Login popup page; hands the session to the opener iframe on this exact origin only."""
+    """Login popup page; tells the opener that cookie-backed login completed on this exact origin only."""
     script, nonce = "", None
     if payload is not None:
         nonce = secrets.token_urlsafe(18)
@@ -190,19 +222,20 @@ def login_start(event):
 def login_finish(event):
     form = urllib.parse.parse_qs(raw_body(event), keep_blank_values=True)
     try:
-        token, payload, nonce, _attributes = auth.complete_login(jobs, (form.get("SAMLResponse") or [""])[0],
-                                                                 (form.get("RelayState") or [""])[0], acs_url(event))
+        _token, payload, nonce, _attributes = auth.complete_login(
+            jobs, (form.get("SAMLResponse") or [""])[0], (form.get("RelayState") or [""])[0], acs_url(event))
+        session_id, _csrf = auth.create_browser_session(jobs, payload)
     except auth.AuthError as error:
-        print(json.dumps({"auth": "rejected", "reason": str(error)[:300]}, ensure_ascii=False))
+        print(json.dumps({"auth": "rejected", **logging_utils.exception_fields(error)}, ensure_ascii=False))
         return popup(403, "登录失败", str(error))
     except Exception as error:  # noqa: BLE001
-        print(json.dumps({"auth": "error", "error": repr(error)[:500]}, ensure_ascii=False))
+        print(json.dumps({"auth": "error", **logging_utils.exception_fields(error)}, ensure_ascii=False))
         return popup(500, "登录失败", "签名或断言校验出错，请稍后重试。")
     print(json.dumps({"auth": "ok", "user": _uref(payload["sub"]), "exp": payload["exp"],
                       "name_source": payload.get("name_source")}, ensure_ascii=False))
-    message = {"type": "qsca-auth", "nonce": nonce, "token": token,
-               "user": {"sub": payload["sub"], "name": payload["name"], "exp": payload["exp"]}}
-    return popup(200, "登录成功", "正在返回聊天窗口…", message, origin(event))
+    response = popup(200, "登录成功", "正在返回聊天窗口…", {"type": "qsca-auth", "nonce": nonce}, origin(event))
+    response["cookies"] = [session_cookie(session_id, max(int(payload["exp"]) - int(time.time()), 0))]
+    return response
 
 
 def _session_jobs_key(user):
@@ -217,10 +250,11 @@ def _remember_job(user, job_id):
                         "expiresAt": int(user["exp"]) + 120})  # sign-out needs the session token, which expires
 
 
-def logout(user):
-    """The 退出 button: this session token stops working at once (other browsers' sessions are not affected), its
-    answers still running are cancelled, and the analysis tools refuse its tool tokens (caller.revocation_check)."""
-    auth.revoke_session(jobs, user, JOB_TOKEN_SECONDS)  # job tool tokens outlive the session token
+def logout(event, user):
+    """The 退出 button: revoke this sign-in, cancel its running answers and clear its opaque browser session."""
+    if user.get("_auth_type") == "browser":
+        auth.delete_browser_session(jobs, user.get("_browser_session"))
+    auth.revoke_session(jobs, user, JOB_TOKEN_SECONDS)  # job tool tokens outlive the browser session
     cancelled = 0
     item = jobs.get_item(Key=_session_jobs_key(user), ConsistentRead=True).get("Item") or {}
     for job_id in item.get("jobIds") or []:
@@ -228,9 +262,13 @@ def logout(user):
             if cancel(str(job_id), user)["statusCode"] == 200:  # 404 / 409: gone or already finished
                 cancelled += 1
         except Exception as error:  # noqa: BLE001 - one job must not fail the sign-out
-            print(json.dumps({"job": str(job_id), "logoutCancel": repr(error)[:300]}))
+            print(json.dumps({"job": str(job_id), "event": "logout_cancel_failed",
+                              **logging_utils.exception_fields(error)}))
     print(json.dumps({"auth": "logout", "user": _uref(user["sub"]), "cancelled": cancelled}))
-    return respond(200, {"ok": True, "cancelled": cancelled})
+    response = respond(200, {"ok": True, "cancelled": cancelled})
+    if user.get("_auth_type") == "browser":
+        response["cookies"] = [session_cookie("", 0)]
+    return response
 
 
 def tool_token(user, analysis):
@@ -254,17 +292,9 @@ def submit(event, user):
     if not isinstance(session_id, str) or not SESSION_ID.match(session_id):
         session_id = f"qs-{uuid.uuid4().hex}"
     if publish_command(prompt):
-        started = time.time()
-        result = run_publish(event, user, analysis)
-        if "error" in result:
-            answer, ok = f"没有发布：{result['error']}", False
-        else:
-            names = "、".join(f"“{d['name']}”（第 {d['version']} 版）" for d in result.get("published", []))
-            answer, ok = f"已把分析的当前内容发布到仪表盘 {names}。打开仪表盘后刷新即可看到；刚发布时图表可能短暂报错，再刷新一次。", True
-        steps = [{"tool": "publish_dashboards", "arguments": {}, "ok": ok}]
-        job_id = answer_directly(user, answer, steps)
-        print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "publish_command", "ok": ok,
-                          "ms": int((time.time() - started) * 1000)}))
+        action = {"type": "publish_dashboards"}
+        job_id = answer_directly(user, "发布会更新由这个分析发布的仪表盘。请确认后再执行。", [action])
+        print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "publish_confirmation"}))
         return respond(202, {"jobId": job_id, "sessionId": session_id})
     # A Runtime session keeps the code version it started with and the browser reuses its id for hours, so bind the
     # session to user, analysis and Runtime version: a redeploy, user switch or another analysis starts fresh.
@@ -293,10 +323,12 @@ def submit(event, user):
         if not ack.get("accepted"):
             raise RuntimeError(ack.get("error") or "runtime did not accept the job")
     except Exception as error:  # noqa: BLE001
-        print(json.dumps({"job": job_id, "error": repr(error)[:800]}))
+        print(json.dumps({"job": job_id, "event": "runtime_submit_failed",
+                          **logging_utils.exception_fields(error)}))
         jobs.update_item(Key={"jobId": job_id}, UpdateExpression="SET #s = :s, #e = :e",
                          ExpressionAttributeNames={"#s": "status", "#e": "error"},
-                         ExpressionAttributeValues={":s": "FAILED", ":e": f"提交到 Runtime 失败: {str(error)[:300]}"})
+                         ExpressionAttributeValues={":s": "FAILED",
+                                                    ":e": f"请求失败（{type(error).__name__}，作业 {job_id}）。请重试或联系管理员。"})
         return respond(502, {"error": "runtime did not accept the job", "jobId": job_id})
     print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "submitted", "analysis": analysis, "where": where,
                       "runtimeVersion": RUNTIME_VERSION}, ensure_ascii=False))
@@ -343,7 +375,8 @@ def cancel(job_id, user):
             accept="application/json", payload=json.dumps({"cancel": {"jobId": job_id}}).encode("utf-8"))
         signalled = bool(json.loads(response["response"].read().decode("utf-8")).get("cancelled"))
     except Exception as error:  # noqa: BLE001
-        print(json.dumps({"job": job_id, "cancelSignal": repr(error)[:500]}))
+        print(json.dumps({"job": job_id, "event": "cancel_signal_failed",
+                          **logging_utils.exception_fields(error)}))
     print(json.dumps({"job": job_id, "user": _uref(user["sub"]), "event": "cancelled", "signalled": signalled}))
     return respond(200, {"jobId": job_id, "status": "CANCELLED", "signalled": signalled})
 
@@ -361,13 +394,13 @@ def apply_change(change_id, event, user):
         {"__tool": "apply_pending_change", "pending_change_id": change_id, "_caller": tool_token(user, analysis),
          "_analysis": analysis}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
-    print(json.dumps({"change": change_id, "user": _uref(user["sub"]), "event": "apply", "ok": "error" not in result,
-                      "error": _safe_err(result.get("error"))}, ensure_ascii=False))
+    print(json.dumps({"change": change_id, "user": _uref(user["sub"]), "event": "apply", "ok": "error" not in result},
+                     ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
 
 def publish_dashboards(event, user):
-    """The 发布到仪表盘 button after an applied change; the analysis-tools Lambda checks the user's permissions."""
+    """The confirmed 发布到仪表盘 button; the analysis-tools Lambda checks the user's permissions."""
     try:
         body = request_json(event)
     except ValueError:
@@ -377,6 +410,21 @@ def publish_dashboards(event, user):
         return respond(400, {"error": "invalid analysis"})
     result = run_publish(event, user, analysis)
     return respond(409 if "error" in result else 200, result)
+
+
+def undo_change(event, user):
+    """The confirmed undo button. Only the literal JSON boolean true enables overwriting later edits."""
+    try:
+        body = request_json(event)
+    except ValueError:
+        return respond(400, {"error": "invalid JSON"})
+    analysis = body.get("analysis")
+    if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
+        return respond(400, {"error": "invalid analysis"})
+    if "force" in body and not isinstance(body["force"], bool):
+        return respond(400, {"error": "force must be a boolean"})
+    return run_button_tool(event, user, "undo_last_visual_change", analysis,
+                           {"force": body.get("force") is True})
 
 
 def run_button_tool(event, user, tool, analysis=None, extra=None):
@@ -391,8 +439,8 @@ def run_button_tool(event, user, tool, analysis=None, extra=None):
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(payload).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     if tool == "bind_chat":
-        print(json.dumps({"user": _uref(user["sub"]), "event": "bind_chat", "analysis": analysis, "ok": "error" not in result,
-                          "changed": result.get("changed"), "error": _safe_err(result.get("error"))}, ensure_ascii=False))
+        print(json.dumps({"user": _uref(user["sub"]), "event": "bind_chat", "analysis": analysis,
+                          "ok": "error" not in result, "changed": result.get("changed")}, ensure_ascii=False))
     return respond(409 if "error" in result else 200, result)
 
 
@@ -403,12 +451,12 @@ def run_publish(event, user, analysis):
          "_chat_url": f"https://{domain}"}).encode("utf-8"))
     result = json.loads(response["Payload"].read() or b"{}")
     print(json.dumps({"user": _uref(user["sub"]), "event": "publish_dashboards", "ok": "error" not in result,
-                      "published": result.get("published"), "error": _safe_err(result.get("error"))}, ensure_ascii=False))
+                      "published": result.get("published")}, ensure_ascii=False))
     return result
 
 
-# "发布到仪表盘" typed in the chat runs the same publish as the button, here and without the model (which could
-# answer from the conversation history instead of acting). Short requests only; questions and negations go to the model.
+# A short typed publish request creates a confirmation action without invoking QuickSight. Questions and negations
+# still go to the model; only the rendered button reaches the state-changing endpoint.
 PUBLISH_WORDS = re.compile(r"发布|更新|同步|推送")
 PUBLISH_TARGET = re.compile(r"仪表盘|仪表板|控制面板|看板|dashboard", re.I)
 NOT_PUBLISH = re.compile(r"不要|别|不用|无需|吗|？|\?|怎么|如何|为什么|什么时候|能否|是否|会不会|撤销|改成|改为|新增|删除|画")
@@ -420,14 +468,38 @@ def publish_command(prompt):
         and not NOT_PUBLISH.search(text)
 
 
-def answer_directly(user, answer, steps):
-    """Store a finished job (no Runtime call) so the page shows it like any other answer."""
+def answer_directly(user, answer, actions):
+    """Store a finished confirmation job without invoking the Runtime or a state-changing tool."""
     job_id, now = uuid.uuid4().hex, int(time.time())
     jobs.put_item(Item={"jobId": job_id, "status": "SUCCEEDED", "owner": user["sub"], "createdAt": now, "heartbeatAt": now,
                         "expiresAt": now + JOB_TTL_SECONDS,
-                        "result": json.dumps({"answer": answer, "steps": steps, "model": "（直接执行）", "totalMs": 0},
-                                             ensure_ascii=False)})
+                        "result": json.dumps({"answer": answer, "actions": actions, "steps": [],
+                                              "model": "（等待确认）", "totalMs": 0}, ensure_ascii=False)})
     return job_id
+
+
+def bounded_examples_request(event):
+    """Parse and shape-check an example mutation before any list is copied or sent to the tools Lambda."""
+    body = request_json(event, EXAMPLES_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise ValueError("examples body must be an object")
+    for key in ("groups", "base"):
+        if key not in body:
+            continue
+        groups = body[key]
+        if not isinstance(groups, list) or len(groups) > 8:
+            raise ValueError(f"{key} must contain at most 8 groups")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("example group must be an object")
+            questions = group.get("questions", [])
+            if not isinstance(questions, list) or len(questions) > 20:
+                raise ValueError("example group must contain at most 20 questions")
+    if "add" in body:
+        add = body["add"]
+        if not isinstance(add, dict) or not isinstance(add.get("question"), str) or len(add["question"]) > 200:
+            raise ValueError("add.question must be a string of at most 200 characters")
+    return body
 
 
 def handler(event, context):
@@ -435,7 +507,7 @@ def handler(event, context):
     method, path = http.get("method", ""), event.get("rawPath", "/")
     if method == "GET" and path in ("/", "/index.html"):
         query = event.get("queryStringParameters") or {}
-        print(json.dumps({"event": "page", "params": sorted(query), "where": query.get("where")}))
+        print(json.dumps({"event": "page", "dashboard": query.get("where") == "dashboard"}))
         return respond(200, INDEX_HTML, PAGE_HEADERS)
     if method == "GET" and path in STATIC:
         return respond(200, STATIC[path], STATIC_HEADERS)
@@ -448,14 +520,19 @@ def handler(event, context):
     user = current_user(event)
     if not user:
         return respond(401, {"error": "unauthorized", "login": True})
+    if method == "POST" and not csrf_matches(event, user):
+        return respond(403, {"error": "CSRF validation failed"})
     if method == "GET" and path == "/me":
-        return respond(200, {"sub": user["sub"], "name": user.get("name"), "exp": user["exp"]})
+        return respond(200, {"sub": user["sub"], "name": user.get("name"), "exp": user["exp"],
+                             "csrf": user.get("csrf") if user.get("_auth_type") == "browser" else None})
     if method == "POST" and path == "/auth/logout":
-        return logout(user)
+        return logout(event, user)
     if method == "POST" and path == "/chat":
         return submit(event, user)
     if method == "POST" and re.fullmatch(r"/changes/[0-9a-f]{32}/apply", path):
         return apply_change(path.split("/")[2], event, user)
+    if method == "POST" and path == "/changes/undo":
+        return undo_change(event, user)
     if method == "POST" and path == "/dashboards/publish":
         return publish_dashboards(event, user)
     if method == "GET" and path == "/bindable":
@@ -466,9 +543,9 @@ def handler(event, context):
         return run_button_tool(event, user, "get_examples", (event.get("queryStringParameters") or {}).get("analysis"))
     if method == "POST" and path == "/examples":
         try:
-            body = request_json(event)
-        except ValueError:
-            body = {}
+            body = bounded_examples_request(event)
+        except (ValueError, UnicodeError):
+            return respond(400, {"error": f"invalid or oversized examples (maximum {EXAMPLES_BODY_BYTES} bytes)"})
         extra = {k: body[k] for k in ("groups", "add", "reset", "base") if k in body}
         return run_button_tool(event, user, "save_examples", body.get("analysis"), extra)
     if method == "POST" and path == "/bind":

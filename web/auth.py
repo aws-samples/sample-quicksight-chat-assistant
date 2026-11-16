@@ -1,26 +1,27 @@
-"""IAM Identity Center SAML 2.0 (SP-initiated) login, session tokens and tool tokens for the chat page.
+"""IAM Identity Center SAML 2.0 login, opaque browser sessions and tool tokens for the chat page.
 
 The Identity Center application metadata (XML) is read from the SSM parameter IDP_METADATA_PARAMETER on first use,
-so it can be set after deployment (`./qsca idp-metadata <file>`) without redeploying. Tokens are JWTs signed with
-HS256 by PyJWT (tools/common/tokens.py, shared with the tool Lambdas). Two keys: session tokens are signed with the
-Secrets Manager secret SESSION_SECRET_ID, which only this Lambda can read; tool tokens with TOOL_SECRET_ID, which the
-tool Lambdas read to verify them (so a tool Lambda cannot mint a browser session).
+so it can be set after deployment (`./qsca idp-metadata <file>`) without redeploying. Signed session JWT helpers remain
+for the administrator smoke command and unit compatibility, but browsers receive only an opaque cookie whose claims
+and CSRF token are stored in DynamoDB. Tool JWTs use TOOL_SECRET_ID, which the tool Lambdas may read; they cannot mint
+browser sessions.
 
 All XML parsing goes through _parse_xml: a parser that resolves no entities, loads no DTD and fetches nothing, and
 any document with a DOCTYPE is refused. The AuthnRequest is built with lxml element APIs, never by string formatting.
 
 Flow: the chat iframe opens a popup at /auth/login?nonce=..., which redirects to Identity Center with an
-AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the popup hands a
-session token (1 hour by default) back to the iframe with postMessage, restricted to this origin and matched by
-nonce. Sign-out revokes the session token (its jti is stored until it would have expired). Tool calls never use the
-session token: the web Lambda issues a separate tool token per job or button click (see tokens.py).
+AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the response sets a Secure,
+HttpOnly cookie and tells the iframe only that login completed. The iframe reads identity and CSRF state from /me.
+Sign-out deletes the opaque session and records its jti until all derived tool tokens expire.
 """
 
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 import urllib.parse
 import uuid
@@ -34,6 +35,7 @@ from signxml import XMLVerifier
 from signxml.exceptions import SignXMLException
 
 import tokens
+import logging_utils
 
 NS = {
     "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
@@ -138,6 +140,38 @@ def _tool_key():
 
 def _revoked_key(jti):
     return {"jobId": f"revoked#{jti}"}
+
+
+def _browser_session_key(session_id):
+    digest = hashlib.sha256(session_id.encode("ascii")).hexdigest()
+    return {"jobId": f"browser-session#{digest}"}
+
+
+def create_browser_session(table, claims):
+    """Store a browser session and return its opaque cookie value and separately readable CSRF token."""
+    session_id = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
+    item = {**_browser_session_key(session_id), "sub": claims["sub"], "name": claims.get("name", ""),
+            "name_source": claims.get("name_source", ""), "jti": claims["jti"], "iat": int(claims["iat"]),
+            "exp": int(claims["exp"]), "csrf": csrf, "createdAt": int(time.time()), "expiresAt": int(claims["exp"]) + 60}
+    table.put_item(Item=item)
+    return session_id, csrf
+
+
+def verify_browser_session(session_id, table):
+    """Return server-side claims for an unexpired opaque browser session, without accepting a JWT from the browser."""
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", session_id):
+        return None
+    item = table.get_item(Key=_browser_session_key(session_id), ConsistentRead=True).get("Item")
+    if not item or int(item.get("exp") or 0) <= time.time():
+        return None
+    return {key: item.get(key) for key in ("sub", "name", "name_source", "jti", "iat", "exp", "csrf")}
+
+
+def delete_browser_session(table, session_id):
+    """Delete an opaque browser session. Tool-token revocation is handled separately through its stored jti."""
+    if isinstance(session_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{40,100}", session_id):
+        table.delete_item(Key=_browser_session_key(session_id))
 
 
 def mint_session(subject, name):
@@ -349,7 +383,7 @@ def directory_name(email):
         return display_name({"familyName": name.get("FamilyName"), "givenName": name.get("GivenName"),
                              "displayName": user.get("DisplayName")})
     except Exception as error:  # noqa: BLE001 - the name is cosmetic; never fail a login over it
-        print(json.dumps({"auth": "name_lookup_failed", "error": repr(error)[:200]}))
+        print(json.dumps({"auth": "name_lookup_failed", **logging_utils.exception_fields(error)}))
         return ""
 
 

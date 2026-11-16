@@ -15,7 +15,7 @@ AGGS = {"sum": "SUM({})", "avg": "AVG({})", "min": "MIN({})", "max": "MAX({})", 
 GRAINS = ("hour", "day", "week", "month", "quarter", "year")
 OPS = ("eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte", "between", "contains", "is_null", "not_null")
 LIST_OPS, NULL_OPS = ("in", "not_in", "between"), ("is_null", "not_null")
-MAX_METRICS, MAX_DIMENSIONS, MAX_FILTERS, MAX_IN_VALUES, MAX_LIMIT = 10, 3, 12, 200, 500
+MAX_METRICS, MAX_DIMENSIONS, MAX_FILTERS, MAX_POLICY_FILTERS, MAX_IN_VALUES, MAX_LIMIT = 10, 3, 12, 50, 200, 500
 MAX_VALUE_LENGTH = 500
 DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SPEC_KEYS = {"metrics", "dimensions", "time", "filters", "order_by", "limit"}
@@ -159,11 +159,11 @@ def _operand(flt, op):
     return _scalar(value)
 
 
-def compile_query(spec, columns, source, dialect):
-    """Return (sql, params, output_columns).
+def compile_query(spec, columns, source, dialect, mandatory_filters=None, policy_columns=None):
+    """Return (sql, params, output_columns, limit).
 
-    columns: {output column name: {"expr": physical column name, "type": QuickSight type}}
-    source:  {"table": (schema, name)}
+    `columns` is the caller-visible map. `mandatory_filters` is trusted policy derived from the authorized QuickSight
+    definition and may reference only `policy_columns`; those columns remain unavailable everywhere else.
     """
     if not isinstance(spec, dict):
         raise QueryError("查询参数必须是对象")
@@ -178,8 +178,9 @@ def compile_query(spec, columns, source, dialect):
         params[name] = value
         return dialect.param(name)
 
-    def column(name, purpose):
-        info = columns.get(name) if isinstance(name, str) else None
+    def column(name, purpose, available=None):
+        available = columns if available is None else available
+        info = available.get(name) if isinstance(name, str) else None
         if info is None:
             raise QueryError(f"{purpose}引用了不存在或不可用的列：{name}")
         return dialect.quote(info["expr"]), info
@@ -193,6 +194,10 @@ def compile_query(spec, columns, source, dialect):
     filters = spec.get("filters") or []
     if not isinstance(filters, list) or len(filters) > MAX_FILTERS:
         raise QueryError(f"filters 最多 {MAX_FILTERS} 个")
+    mandatory_filters = mandatory_filters or []
+    if not isinstance(mandatory_filters, list) or len(mandatory_filters) > MAX_POLICY_FILTERS:
+        raise QueryError(f"分析的强制过滤器最多支持 {MAX_POLICY_FILTERS} 个")
+    policy_columns = policy_columns or columns
     try:
         limit = max(1, min(MAX_LIMIT, int(spec.get("limit") or 200)))
     except (TypeError, ValueError, OverflowError) as error:
@@ -235,11 +240,12 @@ def compile_query(spec, columns, source, dialect):
         out.append({"name": label, "role": "metric", "column": name, "agg": agg})
 
     where = []
-    for flt in filters:
+    for index, flt in enumerate([*filters, *mandatory_filters]):
         if not isinstance(flt, dict) or flt.get("op") not in OPS:
             raise QueryError(f"filters[].op 只能是 {', '.join(OPS)}")
         _known_keys(flt, FILTER_KEYS, "filters[]")
-        expression, info = column(flt.get("column"), "filters ")
+        available = columns if index < len(filters) else policy_columns
+        expression, info = column(flt.get("column"), "filters ", available)
         op = flt["op"]
         value = _operand(flt, op)
         is_time = info["type"] in ("DATETIME", "DATE")

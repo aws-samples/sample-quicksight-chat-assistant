@@ -6,7 +6,7 @@ Tools (the Runtime adds `_caller`, `_analysis` and `_parameters` - the current c
 - preview_analysis_change    validate one edit (tools/common/edits.py: chart type, title, measures, category, color,
                              sort, add or delete a visual) on a copy, record it as a pending change (10 minutes) owned
                              by the caller, and return the query that reproduces the edited visual's data.
-- undo_last_visual_change    restore the definition saved before the latest applied change.
+- undo_last_visual_change    NOT a gateway tool: only the web Lambda calls it after the user confirms undo.
 - apply_pending_change       NOT a gateway tool: only the web Lambda calls it, when the user presses 应用到分析.
 Writes need quicksight:UpdateAnalysis for the caller on that analysis; every write first saves the previous
 definition to S3.
@@ -25,6 +25,7 @@ import boto3
 import caller
 import definition as defs
 import edits
+import logging_utils
 import publisher
 from caller import ToolError, log
 
@@ -86,28 +87,54 @@ def _save(aid, name, definition):
     return info["LastUpdatedTime"]
 
 
-def dataset_columns(definition):
-    """{dataset identifier: {column: QuickSight type}} including the analysis' calculated fields (type CALCULATED)."""
-    out = {}
+def dataset_columns(definition, caller_arns):
+    """Viewer-queryable, CLS-filtered columns keyed by dataset identifier, plus safe visible calculated fields."""
+    out, permitted = {}, {}
+    visible = defs.viewer_columns(definition)
     for declaration in definition.get("DataSetIdentifierDeclarations", []):
+        identifier = declaration["Identifier"]
         dataset_id = declaration["DataSetArn"].rsplit("/", 1)[-1]
         try:
             description = caller.cached(f"ds:{dataset_id}", lambda d=dataset_id: qs.describe_data_set(
                 AwsAccountId=caller.ACCOUNT, DataSetId=d)["DataSet"])
-            out[declaration["Identifier"]] = {c["Name"]: c["Type"] for c in description.get("OutputColumns", [])}
+            output = {column["Name"] for column in description.get("OutputColumns", [])}
+            permitted[identifier] = defs.cls_columns(description, caller_arns, output)
+            allowed = visible.get(dataset_id, set()) & permitted[identifier]
+            out[identifier] = {column["Name"]: column["Type"] for column in description.get("OutputColumns", [])
+                               if column["Name"] in allowed}
         except Exception as error:  # noqa: BLE001 - permissions on a dataset should not break the summary
-            log(event="describe_data_set_failed", dataset=dataset_id, error=repr(error)[:200])
-            out[declaration["Identifier"]] = {}
-    for field in definition.get("CalculatedFields", []):
-        out.setdefault(field.get("DataSetIdentifier"), {})[field["Name"]] = "CALCULATED"
+            log(event="describe_data_set_failed", dataset=dataset_id, **logging_utils.exception_fields(error))
+            out[identifier], permitted[identifier] = {}, set()
+
+    calculated = {(field.get("DataSetIdentifier"), field["Name"]): field.get("Expression")
+                  for field in definition.get("CalculatedFields", [])}
+
+    def calculation_allowed(identifier, name, checking):
+        if (identifier, name) in checking:
+            return False
+        checking = checking | {(identifier, name)}
+        for dependency in defs.expression_columns(calculated[(identifier, name)]):
+            if (identifier, dependency) in calculated:
+                if not calculation_allowed(identifier, dependency, checking):
+                    return False
+            elif dependency not in permitted.get(identifier, set()):
+                return False
+        return True
+
+    ids = defs.dataset_ids(definition)
+    for identifier, name in calculated:
+        dataset_id = ids.get(identifier)
+        if name in visible.get(dataset_id, set()) and calculation_allowed(identifier, name, set()):
+            out.setdefault(identifier, {})[name] = "CALCULATED"
     return out
 
 
 def describe_analysis(args):
-    _email, aid = caller.require_viewer(args)
-    name, definition = _analysis(aid)
-    summary = defs.strip_for_model(definition)
-    columns = {ds: dict(list(cols.items())[:150]) for ds, cols in dataset_columns(definition).items()}
+    email, aid, dashboard_id = caller.require_viewer(args)
+    name, definition = caller.viewer_definition(aid, dashboard_id)
+    all_columns = dataset_columns(definition, caller.principals(email))
+    summary = defs.strip_for_model(definition, {dataset: set(items) for dataset, items in all_columns.items()})
+    columns = {dataset: dict(list(items.items())[:150]) for dataset, items in all_columns.items()}
     return {"analysis_id": aid, "name": name, **summary, "columns": columns,
             "note": ("visual_id 用于 preview_analysis_change；datasets 的值是 dataset_id，用于 query_dataset；"
                      + "columns 按数据集标识列出可用于编辑图表的列和类型。")}
@@ -122,7 +149,7 @@ def preview_analysis_change(args):
     if "color" in args and args.get("color") is None:
         edit["color"] = None
     _name, definition = _analysis(aid)
-    columns = dataset_columns(definition)
+    columns = dataset_columns(definition, caller.principals(email))
     draft = json.loads(json.dumps(definition, default=str))
     try:
         visual_id, summary = edits.apply_edit(draft, edit, columns)
@@ -137,6 +164,7 @@ def preview_analysis_change(args):
     ids = defs.dataset_ids(draft)
     if "query" in preview:
         preview["query"]["dataset_id"] = ids.get(preview["query"].pop("dataset"))
+        preview["query"]["_preview_capability"] = caller.mint_preview_capability(email, aid, preview["query"])
     change_id, now = uuid.uuid4().hex, int(time.time())
     jobs.put_item(Item={"jobId": f"pending#{change_id}", "status": "PENDING", "owner": email, "analysisId": aid,
                         "edit": json.dumps(edit, ensure_ascii=False), "summary": summary, "createdAt": now,
@@ -153,7 +181,7 @@ def _apply(email, aid, edit):
     name, definition = _analysis(aid)
     original = json.loads(json.dumps(definition, default=str))
     try:
-        visual_id, summary = edits.apply_edit(definition, edit, dataset_columns(definition))
+        visual_id, summary = edits.apply_edit(definition, edit, dataset_columns(definition, caller.principals(email)))
     except edits.EditError as error:
         raise ToolError(f"分析在预览之后有变化，无法应用：{error}") from error
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -197,7 +225,7 @@ def apply_pending_change(args):
     jobs.update_item(Key=key, UpdateExpression="SET #s = :applied, appliedAt = :t", ExpressionAttributeNames={"#s": "status"},
                      ExpressionAttributeValues={":applied": "APPLIED", ":t": int(time.time())})
     return {"changed": True, "visual_id": visual_id, "summary": summary,
-            "message": "已修改，请手动刷新页面查看。只改了分析；仪表盘要重新发布才会变化。在聊天里说“撤销”可以恢复。"}
+            "message": "已修改，请手动刷新页面查看。只改了分析；仪表盘要重新发布才会变化。发送“撤销”后需在聊天页确认。"}
 
 
 def undo_last_visual_change(args):
@@ -208,7 +236,7 @@ def undo_last_visual_change(args):
         raise ToolError("没有可以撤销的图表修改")
     key = keys[-1]
     tags = {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket=BUCKET, Key=key)["TagSet"]}
-    if not args.get("force"):
+    if args.get("force") is not True:
         if tags.get("fingerprint"):
             # Compare content, not LastUpdatedTime: an open editor re-saves the analysis (scroll position etc.).
             _name, now = _analysis(aid)
@@ -321,8 +349,8 @@ def _chat_urls(definition):
 
 def chat_binding(args):
     """The parameters the analysis has now, so a bound chat can tell its URL is out of date."""
-    _email, aid = caller.require_viewer(args)
-    _name, definition = _analysis(aid)
+    _email, aid, dashboard_id = caller.require_viewer(args)
+    _name, definition = caller.viewer_definition(aid, dashboard_id)
     return {"analysis_id": aid, "parameters": _parameter_names(definition)}
 
 
@@ -371,16 +399,20 @@ def _clean_examples(groups):
     for group in groups:
         if not isinstance(group, dict):
             raise ToolError("分组格式不对")
+        raw_questions = group.get("questions") or []
+        if not isinstance(raw_questions, list):
+            raise ToolError("问题格式不对")
+        if len(raw_questions) > EXAMPLES_LIMITS["questions"]:
+            raise ToolError(f"每组最多 {EXAMPLES_LIMITS['questions']} 个问题")
         name = " ".join(str(group.get("group") or "").split())[:EXAMPLES_LIMITS["group"]]
-        questions = []
-        for q in group.get("questions") or []:
-            q = " ".join(str(q).split())[:EXAMPLES_LIMITS["question"]]
-            if q and q not in questions:
-                questions.append(q)
+        questions, seen = [], set()
+        for value in raw_questions:
+            question = " ".join(str(value).split())[:EXAMPLES_LIMITS["question"]]
+            if question and question not in seen:
+                seen.add(question)
+                questions.append(question)
         if not name or not questions:
             continue  # empty groups are dropped
-        if len(questions) > EXAMPLES_LIMITS["questions"]:
-            raise ToolError(f"“{name}”超过 {EXAMPLES_LIMITS['questions']} 个问题")
         item = {"group": name, "questions": questions}
         tip = " ".join(str(group.get("tip") or "").split())[:EXAMPLES_LIMITS["tip"]]
         if tip:
@@ -394,12 +426,11 @@ def _clean_examples(groups):
 def get_examples(args):
     """Example questions for the chat page: the analysis' own set (shared with its dashboards) or none (the page
     then shows the deployment default). can_edit tells the page whether to offer 管理 / 加入示例."""
-    email, aid = caller.require_viewer(args)
+    email, aid, _dashboard_id = caller.require_viewer(args)
     item = jobs.get_item(Key=_examples_key(aid)).get("Item") or {}
     can_edit = caller._has(caller.analysis_permissions(aid), caller.principals(email), "quicksight:UpdateAnalysis")
     groups = json.loads(item["groups"]) if item.get("groups") else None
-    return {"groups": groups, "can_edit": can_edit, "updated_by": item.get("updatedBy"),
-            "updated_at": int(item["updatedAt"]) if item.get("updatedAt") else None}
+    return {"groups": groups, "can_edit": can_edit}
 
 
 def save_examples(args):
@@ -412,16 +443,19 @@ def save_examples(args):
         log(event="examples_reset", by=caller.uref(email), analysis=aid)
         return {"groups": None}
     if isinstance(args.get("add"), dict):
+        question = args["add"].get("question")
+        if not isinstance(question, str) or len(question) > EXAMPLES_LIMITS["question"]:
+            raise ToolError(f"问题最多 {EXAMPLES_LIMITS['question']} 个字符")
         current = jobs.get_item(Key=key).get("Item") or {}
-        groups = json.loads(current["groups"]) if current.get("groups") else \
+        raw_groups = json.loads(current["groups"]) if current.get("groups") else \
             (args.get("base") if isinstance(args.get("base"), list) else [])
+        groups = _clean_examples(raw_groups)
         name = " ".join(str(args["add"].get("group") or "常用问题").split())[:EXAMPLES_LIMITS["group"]]
         target = next((g for g in groups if g.get("group") == name), None)
         if target is None:
             target = {"group": name, "questions": []}
             groups.insert(0, target)
-        target["questions"] = [str(args["add"].get("question") or "")] + \
-            [q for q in target.get("questions", []) if q != args["add"].get("question")]
+        target["questions"] = [question] + [q for q in target.get("questions", []) if q != question]
     else:
         groups = args.get("groups")
     groups = _clean_examples(groups)
@@ -439,8 +473,8 @@ TOOLS = {"describe_analysis": describe_analysis, "preview_analysis_change": prev
          "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change,
          "publish_dashboards": publish_dashboards, "bindable_analyses": bindable_analyses,
          "chat_binding": chat_binding, "bind_chat": bind_chat, "get_examples": get_examples, "save_examples": save_examples}
-BUTTON_ONLY = ("apply_pending_change", "publish_dashboards", "bindable_analyses", "chat_binding", "bind_chat",
-               "get_examples", "save_examples")
+BUTTON_ONLY = ("apply_pending_change", "undo_last_visual_change", "publish_dashboards", "bindable_analyses",
+               "chat_binding", "bind_chat", "get_examples", "save_examples")
 
 
 def handler(event, context):
@@ -458,8 +492,8 @@ def handler(event, context):
         # QuickSight definitions contain datetimes (e.g. date parameter defaults); Lambda only returns plain JSON.
         return json.loads(json.dumps(tool(event), ensure_ascii=False, default=str))
     except ToolError as error:
-        log(event="tool_refused", tool=name, reason=caller.safe_err(str(error)))
+        log(event="tool_refused", tool=name, **logging_utils.exception_fields(error))
         return {"error": str(error)}
     except Exception as error:  # noqa: BLE001 - never leak stack traces to the model
-        log(event="tool_failed", tool=name, error=repr(error)[:500])
+        log(event="tool_failed", tool=name, **logging_utils.exception_fields(error))
         return {"error": f"操作失败：{type(error).__name__}"}

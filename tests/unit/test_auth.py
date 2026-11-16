@@ -152,15 +152,17 @@ class CallerTest(unittest.TestCase):
             if DashboardId == "d-deleted":
                 raise not_found
             return {"Permissions": [{"Principal": "arn:u1", "Actions": ["quicksight:DescribeDashboard"]}]}
-        originals = caller.principals, caller.analysis_permissions, caller.dashboards_of
+        originals = caller.principals, caller.analysis_permissions, caller.dashboards_of, caller._dashboard_is_from
         try:
             caller.principals = lambda email: {"arn:u1"}
             caller.analysis_permissions = lambda aid: []
             caller.dashboards_of = lambda aid: ["d-deleted", "d-live"]
+            caller._dashboard_is_from = lambda dashboard, aid: True
             caller.qs.describe_dashboard_permissions = permissions
-            self.assertEqual(caller.require_viewer({"_caller": self.tool("a1"), "_analysis": "a1"}), ("a@example.com", "a1"))
+            self.assertEqual(caller.require_viewer({"_caller": self.tool("a1"), "_analysis": "a1"}),
+                             ("a@example.com", "a1", "d-live"))
         finally:
-            caller.principals, caller.analysis_permissions, caller.dashboards_of = originals
+            caller.principals, caller.analysis_permissions, caller.dashboards_of, caller._dashboard_is_from = originals
             del caller.qs.describe_dashboard_permissions
 
 

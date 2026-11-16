@@ -5,9 +5,11 @@ PostgreSQL / Aurora PostgreSQL / MySQL / Aurora MySQL / MariaDB / RDS (PostgreSQ
 table only projects, renames, casts or tags columns. Custom SQL datasets are refused (their SQL would have to be
 embedded in the query). Anything that would change which rows a user sees in QuickSight - joins, dataset filters,
 row-level security, column-level security the caller is not granted - is refused, because querying the source
-directly would bypass it. Calculated columns are hidden (QuickSight expressions are not SQL), and when the caller
-passes `referenced` only the columns the analysis itself uses are offered.
+directly would bypass it. Calculated columns are hidden (QuickSight expressions are not SQL), and caller-visible
+columns come only from visual field wells and reachable controls in the authorized definition.
 """
+
+import definition as defs
 
 ENGINES = {"POSTGRESQL": "postgresql", "AURORA_POSTGRESQL": "postgresql", "MYSQL": "mysql", "AURORA": "mysql",
            "MARIADB": "mysql"}
@@ -23,14 +25,16 @@ class Unsupported(Exception):
 
 
 def plan(dataset, caller_arns, referenced=None):
-    """dataset: DescribeDataSet()["DataSet"]; referenced: column names the analysis definition uses (None: all).
-    Returns {"data_source_arn", "source", "columns", "hidden", "notes"}; columns outside `referenced` are left out
-    entirely (not listed as hidden either)."""
-    if (dataset.get("RowLevelPermissionDataSet") or {}).get("Status", "ENABLED") == "ENABLED" and \
-            dataset.get("RowLevelPermissionDataSet"):
-        raise Unsupported("数据集启用了行级权限，直接查询数据源会绕过它")
-    if (dataset.get("RowLevelPermissionTagConfiguration") or {}).get("Status") == "ENABLED":
-        raise Unsupported("数据集启用了基于标签的行级权限，直接查询数据源会绕过它")
+    """Build a direct-query plan after RLS, transform, CLS and caller-visible column checks.
+
+    `referenced` is the viewer-queryable set from the authorized definition. The returned public `columns` map is
+    limited to it; `_policy_columns` contains additional CLS-permitted columns only for mandatory filter compilation.
+    """
+    for key in ("RowLevelPermissionDataSet", "RowLevelPermissionTagConfiguration"):
+        if key in dataset:
+            policy = dataset.get(key)
+            if not isinstance(policy, dict) or policy.get("Status") != "DISABLED":
+                raise Unsupported("数据集的行级权限状态不是明确的 DISABLED，直接查询数据源会绕过它")
     physical = dataset.get("PhysicalTableMap") or {}
     if len(physical) != 1:
         raise Unsupported(f"数据集有 {len(physical)} 个物理表（含联接），暂不支持直接查询")
@@ -70,23 +74,23 @@ def plan(dataset, caller_arns, referenced=None):
                 raise Unsupported("数据集定义了过滤条件，直接查询数据源会绕过它")
             elif op not in IGNORED_TRANSFORMS:
                 raise Unsupported(f"数据集里有暂不支持的转换 {op}")
-    if referenced is not None:
-        if any(n not in referenced for n in names):
-            notes.append("只列出分析里用到的列")
-        names = {n: p for n, p in names.items() if n in referenced}
-        hidden = [n for n in hidden if n in referenced]
     output_types = {c["Name"]: c["Type"] for c in dataset.get("OutputColumns", [])}
-    for rule in dataset.get("ColumnLevelPermissionRules") or []:
-        if not set(rule.get("Principals", [])) & set(caller_arns):
-            for name in rule.get("ColumnNames", []):
-                if name in names:
-                    names.pop(name)
-                    hidden.append(name)
-                    notes.append(f"列 {name} 受列级权限限制，已隐藏")
-    columns = {name: {"expr": physical_name, "type": output_types.get(name, _qs_type(types.get(name)))}
-               for name, physical_name in names.items()}
+    allowed = defs.cls_columns(dataset, caller_arns, names)
+    for name in set(names) - allowed:
+        names.pop(name)
+        hidden.append(name)
+        notes.append(f"列 {name} 受列级权限限制，已隐藏")
+    # Mandatory predicates may use non-visible columns, but never a column CLS denies to this caller.
+    policy_columns = {name: {"expr": physical_name, "type": output_types.get(name, _qs_type(types.get(name)))}
+                      for name, physical_name in names.items()}
+    columns = dict(policy_columns)
+    if referenced is not None:
+        if any(name not in referenced for name in columns):
+            notes.append("只列出当前查看资源的图表或可用控件列")
+        columns = {name: info for name, info in columns.items() if name in referenced}
+        hidden = [name for name in hidden if name in referenced]
     return {"data_source_arn": body["DataSourceArn"], "source": source, "columns": columns,
-            "hidden": sorted(set(hidden)), "notes": notes}
+            "_policy_columns": policy_columns, "hidden": sorted(set(hidden)), "notes": notes}
 
 
 def _qs_type(input_type):
@@ -103,8 +107,9 @@ def connection(data_source):
     if key not in PARAM_KEYS:
         raise Unsupported(f"数据源类型 {data_source.get('Type')} 暂不支持（第一版支持 PostgreSQL 和 MySQL 系）")
     engine = PARAM_KEYS[key] or ENGINES.get(data_source.get("Type", ""))
-    out = {"engine": engine, "database": values.get("Database"),
-           "ssl": not (data_source.get("SslProperties") or {}).get("DisableSsl", False)}
+    out = {"engine": engine, "database": values.get("Database"), "ssl": True}
+    if (data_source.get("SslProperties") or {}).get("DisableSsl") is True:
+        raise Unsupported("数据源明确禁用了 TLS；内置查询只允许经过证书验证的 TLS")
     if key == "RdsParameters":
         out["rds_instance"] = values["InstanceId"]
     else:

@@ -1,0 +1,2 @@
+# Direct dependencies for the analysis tools and publisher Lambda bundle.
+PyJWT==2.15.1

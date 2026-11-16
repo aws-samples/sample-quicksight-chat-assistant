@@ -8,6 +8,7 @@ so the assistant never lets anyone do more than QuickSight would.
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import time
 
 import boto3
 
+import logging_utils
 import tokens
 
 ACCOUNT = os.environ["ACCOUNT_ID"]
@@ -26,6 +28,8 @@ CACHE_SECONDS = 60
 ANALYSIS_ID = re.compile(r"^[\w-]{1,512}$")
 
 qs = boto3.client("quicksight", region_name=QS_REGION)
+jobs = boto3.resource("dynamodb", endpoint_url=os.environ.get("DYNAMODB_ENDPOINT_URL") or None).Table(
+    os.environ["JOBS_TABLE"]) if os.environ.get("JOBS_TABLE") else None
 _cache = {}
 
 
@@ -47,6 +51,29 @@ def _tool_key():
         raw = boto3.client("secretsmanager").get_secret_value(SecretId=TOOL_SECRET_ID)["SecretString"]
         return tokens.signing_key(raw)  # same key as web/auth.py _tool_key
     return cached("tool-key", load, 3600)
+
+
+def _preview_digest(query):
+    encoded = json.dumps(query, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def mint_preview_capability(email, analysis, query):
+    """Authorize one exact server-generated visual-preview query for five minutes."""
+    return tokens.mint(_tool_key(), tokens.TOOLS_AUDIENCE, email, 300, analysis=analysis,
+                       purpose="visual-preview", query_sha256=_preview_digest(query))[0]
+
+
+def verify_preview_capability(capability, email, analysis, query):
+    """Require a capability for this caller, analysis and exact preview query."""
+    try:
+        claims = tokens.verify(_tool_key(), capability, tokens.TOOLS_AUDIENCE,
+                               required=("analysis", "purpose", "query_sha256"))
+    except tokens.InvalidToken as error:
+        raise ToolError("图表预览授权无效或已过期，请重新生成预览") from error
+    valid = claims["sub"] == email and claims["analysis"] == analysis and claims["purpose"] == "visual-preview"
+    if not valid or not hmac.compare_digest(str(claims["query_sha256"]), _preview_digest(query)):
+        raise ToolError("图表预览授权与当前查询不匹配，请重新生成预览")
 
 
 # Set by a Lambda that can read the jobs table (the analysis tools): sid -> True when that browser session signed out.
@@ -125,50 +152,82 @@ def analysis_permissions(aid):
         AwsAccountId=ACCOUNT, AnalysisId=aid).get("Permissions", []))
 
 
-SOURCE_TAG = "qsca:source-analysis"  # set by `qsca publish`, whose dashboards are built from a definition
+SOURCE_TAG = "qsca:source-analysis"  # informational only; never used as authorization proof
+
+
+def _analysis_arn(aid):
+    partition = "aws-cn" if QS_REGION.startswith("cn-") else "aws"
+    return f"arn:{partition}:quicksight:{QS_REGION}:{ACCOUNT}:analysis/{aid}"
+
+
+def _dashboard_mapping(dashboard_id):
+    if jobs is None:
+        return None
+    return jobs.get_item(Key={"jobId": f"dashboard#{dashboard_id}"}, ConsistentRead=True).get("Item")
+
+
+def _dashboard_is_from(dashboard_id, aid, dashboard=None):
+    dashboard = dashboard or qs.describe_dashboard(AwsAccountId=ACCOUNT, DashboardId=dashboard_id)["Dashboard"]
+    analysis_arn = _analysis_arn(aid)
+    version = dashboard["Version"]
+    if version.get("SourceEntityArn") == analysis_arn:
+        return True
+    mapping = _dashboard_mapping(dashboard_id)
+    return bool(mapping and mapping.get("analysisArn") == analysis_arn
+                and mapping.get("dashboardArn") == dashboard.get("Arn")
+                and int(mapping.get("versionNumber") or 0) == int(version.get("VersionNumber") or 0))
 
 
 def dashboards_of(aid):
-    """Dashboards whose current version was published from this analysis (console publish: SourceEntityArn;
-    `qsca publish`: the SOURCE_TAG tag)."""
+    """Dashboards proven to originate from this analysis.
+
+    QuickSight's exact SourceEntityArn is authoritative. Definition-based publishes have no source ARN, so trusted
+    publishers write an application-owned dashboard# mapping. Dashboard tags are retained for operations only and
+    are deliberately ignored here because a tag is not provenance.
+    """
     def load():
-        partition = "aws-cn" if QS_REGION.startswith("cn-") else "aws"
-        arn = f"arn:{partition}:quicksight:{QS_REGION}:{ACCOUNT}:analysis/{aid}"
         found = []
         for summary in _paged(qs.list_dashboards, "DashboardSummaryList"):
+            dashboard_id = summary["DashboardId"]
             try:
-                version = qs.describe_dashboard(AwsAccountId=ACCOUNT, DashboardId=summary["DashboardId"])["Dashboard"]["Version"]
+                dashboard = qs.describe_dashboard(AwsAccountId=ACCOUNT, DashboardId=dashboard_id)["Dashboard"]
             except qs.exceptions.ResourceNotFoundException:
                 continue
-            if version.get("SourceEntityArn") == arn:
-                found.append(summary["DashboardId"])
-                continue
-            try:
-                tags = qs.list_tags_for_resource(ResourceArn=summary["Arn"]).get("Tags", [])
-            except Exception:  # noqa: BLE001 - tags are an optional link
-                tags = []
-            if any(t["Key"] == SOURCE_TAG and t["Value"] == aid for t in tags):
-                found.append(summary["DashboardId"])
+            if _dashboard_is_from(dashboard_id, aid, dashboard):
+                found.append(dashboard_id)
         return found
     return cached(f"dashboards:{aid}", load, 300)
 
 
 def require_viewer(args):
-    """The caller may view the analysis, or a dashboard published from it. Returns (email, analysis_id)."""
+    """Return (email, analysis id, dashboard id or None) for the caller's exact viewer scope."""
     aid = analysis_id(args)
     email = verify_token(args.get("_caller"), aid)
     arns = principals(email)
-    if _has(analysis_permissions(aid), arns):
-        return email, aid
+    if _has(analysis_permissions(aid), arns, "quicksight:DescribeAnalysis"):
+        return email, aid, None
     for dashboard_id in dashboards_of(aid):
         try:
+            if not _dashboard_is_from(dashboard_id, aid):
+                continue  # provenance changed since dashboards_of() was cached
             perms = cached(f"dperm:{dashboard_id}", lambda d=dashboard_id: qs.describe_dashboard_permissions(
                 AwsAccountId=ACCOUNT, DashboardId=d).get("Permissions", []))
         except qs.exceptions.ResourceNotFoundException:
             continue  # deleted since dashboards_of() was cached
-        if _has(perms, arns):
-            return email, aid
+        if _has(perms, arns, "quicksight:DescribeDashboard"):
+            return email, aid, dashboard_id
     raise ToolError(f"{email} 没有查看这个分析或其仪表盘的权限")
+
+
+def viewer_definition(aid, dashboard_id=None):
+    """Return (name, definition) from the resource the viewer was authorized to describe."""
+    if dashboard_id:
+        out = cached(f"dashboard-def:{dashboard_id}", lambda: qs.describe_dashboard_definition(
+            AwsAccountId=ACCOUNT, DashboardId=dashboard_id))
+    else:
+        out = cached(f"def:{aid}", lambda: qs.describe_analysis_definition(
+            AwsAccountId=ACCOUNT, AnalysisId=aid))
+    return out.get("Name") or aid, out["Definition"]
 
 
 def require_editor(args):
@@ -180,24 +239,9 @@ def require_editor(args):
     return email, aid
 
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-
 def uref(email):
-    """Non-reversible short reference for a user, for logs only. The signed-in
-    identity is the user's email (PII); web/auth.py and agent/main.py hash it the
-    same way, so logs across the Lambdas and the Runtime stay correlatable without
-    writing the raw email to CloudWatch."""
-    return "u_" + hashlib.sha256((email or "").encode("utf-8")).hexdigest()[:12]
-
-
-def safe_err(text):
-    """Redact email addresses from a tool-error string before it is logged.
-    Some refusals embed the user's email (e.g. '<email> 没有编辑这个分析的权限');
-    the model/user still receives the full message, but the email must not reach logs."""
-    if not isinstance(text, str):
-        return text
-    return _EMAIL_RE.sub("<redacted-email>", text)
+    """Keyed deployment-wide user pseudonym for logs."""
+    return logging_utils.uref(email)
 
 
 def log(**fields):

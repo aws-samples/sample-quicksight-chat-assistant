@@ -22,7 +22,6 @@ sandbox), suggest_controls. Chart numbers always come from tool results.
 """
 
 import copy
-import hashlib
 import datetime as dt
 import json
 import os
@@ -30,6 +29,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 import uuid
 
 import boto3
@@ -45,6 +45,7 @@ from strands.types.exceptions import MaxTokensReachedException
 from strands.types.tools import AgentTool
 
 import charts
+import logging_utils
 import sandbox
 from prompt import SYSTEM_PROMPT
 
@@ -55,9 +56,17 @@ JOBS_TABLE = os.environ.get("JOBS_TABLE", "")
 ANALYSIS_TARGET = os.environ.get("ANALYSIS_TARGET", "analysis")
 DATA_TARGET = os.environ.get("DATA_TARGET", "data")
 TRUSTED_TARGETS = (f"{ANALYSIS_TARGET}___", f"{DATA_TARGET}___")
+ENTERPRISE_READ_ONLY_TOOLS = frozenset(filter(None, os.environ.get("ENTERPRISE_READ_ONLY_TOOLS", "").split(",")))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "8"))
 TOOL_RESULT_LIMIT = 12000
+TOOL_RAW_BYTES_LIMIT = 1024 * 1024
 SUMMARY_LIMIT = 14000
+MODEL_STRING_LIMIT = 2000
+MODEL_CONTAINER_LIMIT = 500
+MODEL_NODE_LIMIT = 10000
+MODEL_DEPTH_LIMIT = 20
+INTERNAL_RESULT_NODE_LIMIT = 20000
+INTERNAL_RESULT_ROWS = 500
 HEARTBEAT_SECONDS = 30
 CONFIG_TTL = 60
 MAX_CHARTS = 4
@@ -87,10 +96,8 @@ def log(**fields):
 
 
 def _uref(sub):
-    """Non-reversible short reference for a user, for logs only. The signed-in
-    sub is the user's email (PII); the web Lambda hashes it the same way before
-    logging, so keep the Runtime logs consistent and free of the raw email."""
-    return "u_" + hashlib.sha256((sub or "").encode("utf-8")).hexdigest()[:12]
+    """Keyed deployment-wide user pseudonym for logs."""
+    return logging_utils.uref(sub)
 
 
 class ConfigError(Exception):
@@ -178,27 +185,133 @@ class WithCaller(AgentTool):
             yield event
 
 
-def _text(result):
-    return "\n".join(part.get("text", "") for part in (result or {}).get("content", []) if "text" in part)
+def _bounded_text(result, byte_limit=TOOL_RAW_BYTES_LIMIT):
+    """Return concatenated text without copying more than byte_limit UTF-8 bytes."""
+    chunks, used, first = [], 0, True
+    for part in (result or {}).get("content", []):
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+            continue
+        if not first:
+            if used == byte_limit:
+                return "".join(chunks), True
+            chunks.append("\n")
+            used += 1
+        first = False
+        value = part["text"]
+        for start in range(0, len(value), 4096):
+            chunk = value[start:start + 4096]
+            encoded = chunk.encode("utf-8")
+            room = byte_limit - used
+            if len(encoded) > room:
+                chunks.append(encoded[:room].decode("utf-8", "ignore"))
+                return "".join(chunks), True
+            chunks.append(chunk)
+            used += len(encoded)
+    return "".join(chunks), False
+
+
+def _json_depth_within(text, depth_limit=MODEL_DEPTH_LIMIT):
+    """Check JSON nesting before parsing; json.loads still performs syntax validation."""
+    depth, quoted, escaped = 0, False, False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > depth_limit:
+                return False
+        elif char in "]}":
+            depth -= 1
+    return True
 
 
 def _call(mcp, name, arguments):
-    """Call a gateway tool from code and return its JSON result; ValueError on a tool error."""
+    """Call a gateway tool from code and return its bounded JSON result; ValueError on a tool error."""
     result = mcp.call_tool_sync(f"sys-{uuid.uuid4().hex[:8]}", name, arguments)
-    text = _text(result)
+    text, truncated = _bounded_text(result)
+    if truncated or not _json_depth_within(text):
+        raise ValueError("工具结果超过安全处理上限")
     try:
         data = json.loads(text) if text else {}
-    except ValueError:
+    except (ValueError, RecursionError):
         data = {"error": text[:300]}
     if result.get("status") != "success" or (isinstance(data, dict) and "error" in data):
         raise ValueError(str(data.get("error") if isinstance(data, dict) else text)[:400])
     return data
 
 
+_XML_LIKE_OPENER = re.compile(r"<(?=\s*(?:/|!|\?)?\s*[^\s<>])")
+
+
+def _invisible_or_control(char):
+    codepoint = ord(char)
+    return (codepoint < 32 or 127 <= codepoint <= 159 or unicodedata.category(char) == "Cf" or
+            char == "\u034f" or "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef")
+
+
+def _scrub_untrusted_text(value, marker, limit=MODEL_STRING_LIMIT):
+    """Bound and neutralize characters that can hide instructions or counterfeit an envelope."""
+    text = str(value)[:limit].replace(marker, "[removed-boundary-marker]")
+    text = "".join(" " if _invisible_or_control(char) else char for char in text)
+    return _XML_LIKE_OPENER.sub("＜", text)
+
+
+def _scrub_untrusted(value, marker, string_limit=MODEL_STRING_LIMIT, *, node_limit=MODEL_NODE_LIMIT,
+                      depth_limit=MODEL_DEPTH_LIMIT):
+    """Scrub while enforcing one global node budget and a maximum nesting depth."""
+    budget = [node_limit]
+
+    def clean(item, depth):
+        if budget[0] <= 0:
+            return "[truncated-node-budget]"
+        budget[0] -= 1
+        if depth > depth_limit:
+            return "[truncated-depth]"
+        if isinstance(item, str):
+            return _scrub_untrusted_text(item, marker, string_limit)
+        if isinstance(item, dict):
+            out = {}
+            for index, (key, nested) in enumerate(item.items()):
+                if index >= MODEL_CONTAINER_LIMIT or budget[0] <= 0:
+                    break
+                out[_scrub_untrusted_text(key, marker, 256)] = clean(nested, depth + 1)
+            return out
+        if isinstance(item, (list, tuple)):
+            out = []
+            for index, nested in enumerate(item):
+                if index >= MODEL_CONTAINER_LIMIT or budget[0] <= 0:
+                    break
+                out.append(clean(nested, depth + 1))
+            return out
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return _scrub_untrusted_text(item, marker, string_limit)
+
+    return clean(value, 0)
+
+
+def _untrusted_envelope(marker, label, value, total_limit):
+    """Serialize model-visible external data inside a per-run boundary."""
+    clean = _scrub_untrusted(value, marker)
+    body = json.dumps(clean, ensure_ascii=False, default=str)
+    if len(body) > total_limit:
+        body = body[:total_limit] + "…（已截断）"
+    return (f"[BEGIN UNTRUSTED DATA {marker} {label}]\n{body}\n"
+            f"[END UNTRUSTED DATA {marker} {label}]")
+
+
 def clean_history(history):
+    """Return browser-authored turns as inert transcript records, never as model assistant-role messages."""
     if not isinstance(history, list):
         return []
-    return [{"role": t["role"], "content": [{"text": t["content"][:4000]}]}
+    return [{"speaker": t["role"], "text": t["content"][:4000]}
             for t in history[-10:]
             if isinstance(t, dict) and t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str)]
 
@@ -210,14 +323,11 @@ def unbacked_claim(result, steps, state):
     used = {s["tool"] for s in steps if s.get("ok")}
     if "应用到分析" in answer and not any(c.get("pending_change") for c in state["charts"]):
         return "preview_analysis_change"
-    if re.search(r"已(强制)?撤销|撤销成功|已(被)?还原|已恢复|撤销被阻止|无法撤销", answer) and "undo_last_visual_change" not in used:
-        return "undo_last_visual_change"
     return None
 
 
-# Undo requests ("撤销", "强制撤销", "撤销上一步的修改", "帮我回退一下") are commands, not questions: run them in code.
-# Models tend to answer them from the conversation history (copying an earlier "已撤销" or "撤销被阻止") without
-# calling the tool. A short message that asks to undo, with no question, negation or other edit in it, counts.
+# Undo requests become browser confirmation actions. A short message that asks to undo, with no question, negation
+# or other edit in it, counts; neither this recognizer nor the model may invoke the state-changing tool.
 UNDO_WORDS = re.compile(r"撤销|撤回|回退|还原|恢复(到)?(之前|上一步|原来)")
 NOT_UNDO = re.compile(r"不要|别|不用|无需|吗|？|\?|什么|怎么|如何|能否|为什么|哪|改成|改为|换成|新增|添加|删除|画|标题|查询|统计")
 
@@ -236,18 +346,6 @@ DASHBOARD_PROMPT = ("当前页面是已发布的仪表盘，不是分析：仪�
                     "改标题、新增或删除图表、撤销时，直接告诉用户：" + DASHBOARD_EDIT_MESSAGE + "\n"
                     "仪表盘里没有“管理”和“☆ 加入示例”：给出示例问题后，告诉用户示例问题要由分析的编辑者在对应的分析里点“管理”设置，"
                     "分析和由它发布的仪表盘共用同一套；不要让用户在这里点“管理”。\n")
-
-
-def run_undo(mcp, injected, force):
-    step = {"tool": "undo_last_visual_change", "arguments": {"force": True} if force else {}, "ok": True}
-    try:
-        data = _call(mcp, f"{ANALYSIS_TARGET}___undo_last_visual_change", {**injected, **step["arguments"]})
-        answer = f"已撤销：{data.get('undid') or '最近一次修改'}。请手动刷新页面查看；仪表盘需要重新发布才会变化。"
-    except ValueError as error:
-        step["ok"] = False
-        answer = f"没有撤销：{error}"
-    log(event="undo_command", force=force, ok=step["ok"])
-    return answer, [step]
 
 
 def clean_parameters(parameters):
@@ -334,12 +432,10 @@ def local_tools(mcp, injected, summary, state):
             change = _call(mcp, f"{ANALYSIS_TARGET}___preview_analysis_change", {**edit, **injected})
         except ValueError as error:
             return json.dumps({"preview_ready": False, "error": str(error)}, ensure_ascii=False)
-        summary_text = change.get("summary", operation)
-        for name, value in injected["_parameters"].items():
-            summary_text = summary_text.replace(f"<<${name}>>", str(value))
-        title_text = change.get("title") or ""
-        for name, value in injected["_parameters"].items():
-            title_text = title_text.replace(f"<<${name}>>", str(value))
+        # Keep model-visible preview labels independent of crafted URL/control values. The data preview still uses the
+        # validated parameters injected into the solution tools, but placeholders remain literal in these labels.
+        summary_text = str(change.get("summary", operation))[:MODEL_STRING_LIMIT]
+        title_text = str(change.get("title") or "")[:MODEL_STRING_LIMIT]
         pending = {"id": change["pending_change_id"], "expires_at": change["expires_at"], "summary": summary_text}
         preview, notes = change.get("preview") or {}, []
         kind = {"BarChartVisual": "bar", "LineChartVisual": "line", "TableVisual": "table"}.get(change.get("kind"), "none")
@@ -395,8 +491,13 @@ def local_tools(mcp, injected, summary, state):
             state["sandbox"] = sandbox.Sandbox(REGION)
         try:
             ran = state["sandbox"].run(frames, code)
-        except Exception as error:  # noqa: BLE001 - report sandbox problems to the model
-            return json.dumps({"ok": False, "error": str(error)[:500]}, ensure_ascii=False)
+        except Exception as error:  # noqa: BLE001 - return metadata, never raw sandbox exception text
+            correlation = uuid.uuid4().hex
+            log(event="analyze_result_failed", correlation=correlation,
+                **logging_utils.exception_fields(error))
+            return json.dumps({"ok": False,
+                               "error": f"沙箱分析失败（{type(error).__name__}，参考 {correlation}）"},
+                              ensure_ascii=False)
         out = {"ok": ran["ok"], "stdout": ran["stdout"], "stderr": ran["stderr"]}
         if ran["rows"]:
             result_id = f"r{len(state['results']) + 1}"
@@ -452,6 +553,7 @@ def run_agent(payload, cancel_signal=None):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000:
         raise ValueError("prompt must be a non-empty string of at most 2000 characters")
     started = time.time()
+    boundary_marker = secrets.token_hex(16)
     analysis = str(payload.get("analysis") or "")
     in_dashboard = payload.get("where") == "dashboard"
     parameters = clean_parameters(payload.get("parameters"))
@@ -494,7 +596,8 @@ def run_agent(payload, cancel_signal=None):
             # Errors inside an already-open stream (HTTP 200, then an error event) are not covered by the client's
             # max_retries, which only retries before the response starts. Retry the model call here.
             timing["retries"] = timing.get("retries", 0) + 1
-            log(event="model_retry", attempt=timing["retries"], ms=ms, error=repr(event.exception)[:200])
+            log(event="model_retry", attempt=timing["retries"], ms=ms,
+                **logging_utils.exception_fields(event.exception))
             time.sleep(min(2 ** timing["retries"], 8))
             event.retry = True
             return
@@ -506,8 +609,8 @@ def run_agent(payload, cancel_signal=None):
             # Record the shape of the response (which block kinds, how big) without logging user-facing content.
             shape = [("text" if p.get("text") is not None else "toolUse" if p.get("toolUse") is not None else "other",
                       len(json.dumps(p.get("text") or p.get("toolUse") or "", ensure_ascii=False))) for p in parts]
-            log(event="model_call", ms=ms, stop=stop, error=repr(event.exception)[:300] if event.exception else None,
-                content_shape=shape)
+            log(event="model_call", ms=ms, stop=stop, content_shape=shape,
+                **(logging_utils.exception_fields(event.exception) if event.exception else {}))
 
     def before_tool(event: BeforeToolCallEvent):
         timing[event.tool_use.get("toolUseId")] = time.time()  # tools may run concurrently: per call
@@ -518,23 +621,31 @@ def run_agent(payload, cancel_signal=None):
         timing["tool_ms"] += int((time.time() - timing.pop(event.tool_use.get("toolUseId"), time.time())) * 1000)
         name = event.tool_use.get("name", "")
         result = event.result or {}
-        text = _text(result)
-        ok = result.get("status") == "success" and event.cancel_message is None
+        text, raw_truncated = _bounded_text(result)
+        unsafe_result = raw_truncated or not _json_depth_within(text)
+        ok = result.get("status") == "success" and event.cancel_message is None and not unsafe_result
         try:
-            parsed = json.loads(text) if text else None
-        except ValueError:
+            parsed = json.loads(text) if text and not unsafe_result else None
+        except (ValueError, RecursionError):
             parsed = None
         if isinstance(parsed, dict) and "error" in parsed:
             ok = False
         local = "___" not in name  # local tools register their own result ids
-        rows = charts.find_rows(parsed) if ok and parsed is not None and not local else None
-        content = text if len(text) <= TOOL_RESULT_LIMIT else text[:TOOL_RESULT_LIMIT] + "…（已截断）"
+        internal = _scrub_untrusted(parsed, boundary_marker, node_limit=INTERNAL_RESULT_NODE_LIMIT) \
+            if ok and parsed is not None and not local else None
+        rows = charts.find_rows(internal) if internal is not None else None
+        if rows:
+            rows = [row for row in rows[:INTERNAL_RESULT_ROWS] if isinstance(row, dict)]
+        model_result = {"error": "工具结果超过安全处理上限，已拒绝"} if unsafe_result else \
+            (parsed if parsed is not None else text)
+        model_payload = {"tool": name, "result": model_result}
         if rows:
             result_id = f"r{len(state['results']) + 1}"
             state["results"][result_id] = rows
-            content += f"\n[result_id: {result_id}] 可以用 plot_result 画这份结果"
-        if content != text:
-            event.result = {**result, "content": [{"text": content}]}
+            model_payload.update(result_id=result_id,
+                                 result_id_usage="可以用 plot_result 画这份结果")
+        event.result = {**result, "content": [{"text": _untrusted_envelope(
+            boundary_marker, "tool-result", model_payload, TOOL_RESULT_LIMIT)}]}
         arguments = {k: v for k, v in (event.tool_use.get("input") or {}).items() if not k.startswith("_")}
         # This solution's tools show their short name; enterprise MCP tools keep "<target>/<tool>" to show the source.
         shown = name.split("___", 1)[-1] if name.startswith(TRUSTED_TARGETS) or "___" not in name else name.replace("___", "/", 1)
@@ -549,38 +660,59 @@ def run_agent(payload, cancel_signal=None):
     with MCPClient(url=GATEWAY_URL, auth_provider=GatewaySigV4()) as mcp:
         undo = undo_command(prompt)
         if undo and analysis:
-            answer, steps = (DASHBOARD_EDIT_MESSAGE, []) if in_dashboard else run_undo(mcp, injected, force=undo["force"])
             elapsed = int((time.time() - started) * 1000)
-            log(event="answered", user=_uref(user.get("sub")), analysis=analysis, steps=1, charts=0, elapsed_ms=elapsed,
-                model=None, setup_ms=elapsed, model_ms=[], tool_ms=elapsed, usage={})
-            return {"answer": answer, "steps": steps, "model": "（直接执行）", "elapsed_ms": elapsed}
+            if in_dashboard:
+                answer, actions = DASHBOARD_EDIT_MESSAGE, []
+            else:
+                forced = undo["force"] is True
+                answer = "强制撤销会覆盖这次修改之后的其他编辑。请确认后再执行。" if forced else \
+                    "撤销会恢复最近一次由助手应用的修改。请确认后再执行。"
+                actions = [{"type": "undo_last_visual_change", "force": forced}]
+            log(event="undo_confirmation", user=_uref(user.get("sub")), analysis=analysis, force=undo["force"],
+                elapsed_ms=elapsed)
+            return {"answer": answer, "actions": actions, "steps": [], "model": "（等待确认）",
+                    "elapsed_ms": elapsed}
         gateway_tools = mcp.list_tools_sync()
         try:
             summary = _call(mcp, f"{ANALYSIS_TARGET}___describe_analysis", injected) if analysis else \
                 {"error": "聊天窗口没有绑定分析"}
         except ValueError as error:
             summary = {"error": str(error)}
-        replaced = {f"{ANALYSIS_TARGET}___preview_analysis_change"}
-        if in_dashboard:  # a published dashboard does not change when the analysis is edited: offer no edit tools
-            replaced |= {f"{ANALYSIS_TARGET}___undo_last_visual_change", f"{ANALYSIS_TARGET}___apply_pending_change"}
-        tools = [WithCaller(t, injected) if t.tool_name.startswith(TRUSTED_TARGETS) else t
-                 for t in gateway_tools if t.tool_name not in replaced]
+        # These write paths are local previews or button-only operations, never Gateway/model tools.
+        replaced = {f"{ANALYSIS_TARGET}___preview_analysis_change",
+                    f"{ANALYSIS_TARGET}___undo_last_visual_change",
+                    f"{ANALYSIS_TARGET}___apply_pending_change"}
+        tools = []
+        for gateway_tool in gateway_tools:
+            name = gateway_tool.tool_name
+            if name in replaced:
+                continue
+            if name.startswith(TRUSTED_TARGETS):
+                tools.append(WithCaller(gateway_tool, injected))
+            elif name in ENTERPRISE_READ_ONLY_TOOLS:
+                tools.append(gateway_tool)
         tools += [t for t in local_tools(mcp, injected, summary, state)
                   if not (in_dashboard and t.tool_name == "preview_analysis_change")]
         controls = {name: {"control": (summary.get("parameters", {}).get(name) or {}).get("control"), "value": value}
                     for name, value in parameters.items()} if isinstance(summary, dict) else parameters
         today = dt.datetime.now(dt.timezone.utc).astimezone(dt.timezone(dt.timedelta(hours=8)))
-        system = (f"{SYSTEM_PROMPT}\n\n{DASHBOARD_PROMPT if in_dashboard else ''}今天是 {today:%Y-%m-%d}（北京时间）。\n当前控件值：{json.dumps(controls, ensure_ascii=False)}\n"
-                  f"分析结构：{json.dumps(summary, ensure_ascii=False, default=str)[:SUMMARY_LIMIT]}")
-        agent = Agent(model=model, tools=tools, system_prompt=system, messages=clean_history(payload.get("history")),
-                      callback_handler=on_stream)
+        system = (f"{SYSTEM_PROMPT}\n\n{DASHBOARD_PROMPT if in_dashboard else ''}"
+                  f"今天是 {today:%Y-%m-%d}（北京时间）。")
+        request_message = "\n\n".join([
+            _untrusted_envelope(boundary_marker, "current-request", {"request": prompt.strip()}, 3000),
+            _untrusted_envelope(boundary_marker, "current-controls", controls, 10000),
+            _untrusted_envelope(boundary_marker, "authorized-analysis", summary, SUMMARY_LIMIT),
+            _untrusted_envelope(boundary_marker, "browser-transcript",
+                                clean_history(payload.get("history")), 20000),
+        ])
+        agent = Agent(model=model, tools=tools, system_prompt=system, messages=[], callback_handler=on_stream)
         timing["setup_ms"] = int((time.time() - started) * 1000)
         agent.hooks.add_callback(BeforeModelCallEvent, before_model)
         agent.hooks.add_callback(AfterModelCallEvent, after_model)
         agent.hooks.add_callback(BeforeToolCallEvent, before_tool)
         agent.hooks.add_callback(AfterToolCallEvent, after_tool)
         try:
-            result = agent(prompt.strip(), cancel_signal=cancel_signal)
+            result = agent(request_message, cancel_signal=cancel_signal)
             claim = None if in_dashboard else unbacked_claim(result, steps, state)
             if claim and result.stop_reason != "cancelled":
                 # The model said it made a preview / undid a change without calling the tool (it copies earlier turns
@@ -657,14 +789,20 @@ class Job:
         except Cancelled:
             log(event="job_cancelled", job=self.id, after_s=int(time.time() - self.started))
         except ConfigError as error:
-            self._write("SET #s = :failed, #e = :e", {":failed": "FAILED", ":e": str(error)}, {"#e": "error"})
-        except MaxTokensReachedException as error:  # the "max_tokens" model param cut off a runaway generation
-            log(event="job_failed", job=self.id, error=repr(error)[:300])
+            log(event="job_failed", job=self.id, **logging_utils.exception_fields(error))
             self._write("SET #s = :failed, #e = :e", {":failed": "FAILED",
-                        ":e": "模型这次输出过长被截断（超过 max_tokens），请重试或把问题拆小。"}, {"#e": "error"})
+                        ":e": f"请求失败（{type(error).__name__}，作业 {self.id}）。请重试或联系管理员。"},
+                        {"#e": "error"})
+        except MaxTokensReachedException as error:  # the "max_tokens" model param cut off a runaway generation
+            log(event="job_failed", job=self.id, **logging_utils.exception_fields(error))
+            self._write("SET #s = :failed, #e = :e", {":failed": "FAILED",
+                        ":e": f"请求失败（{type(error).__name__}，作业 {self.id}）。请缩小问题后重试。"},
+                        {"#e": "error"})
         except Exception as error:  # noqa: BLE001 - report, never crash the server
-            log(event="job_failed", job=self.id, error=repr(error)[:800])
-            self._write("SET #s = :failed, #e = :e", {":failed": "FAILED", ":e": str(error)[:500]}, {"#e": "error"})
+            log(event="job_failed", job=self.id, **logging_utils.exception_fields(error))
+            self._write("SET #s = :failed, #e = :e", {":failed": "FAILED",
+                        ":e": f"请求失败（{type(error).__name__}，作业 {self.id}）。请重试或联系管理员。"},
+                        {"#e": "error"})
         finally:
             self.stop.set()
             with Job.lock:

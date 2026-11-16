@@ -6,7 +6,8 @@ import unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(ROOT, "tools", "analysis"))
+for sub in ("tools/analysis", "tools/common"):
+    sys.path.insert(0, os.path.join(ROOT, sub))
 os.environ.setdefault("ACCOUNT_ID", "1")
 os.environ.setdefault("CHAT_URL", "https://chat.example.com")
 os.environ.setdefault("QS_REGION", "cn-north-1")
@@ -47,12 +48,44 @@ class PublisherTest(unittest.TestCase):
         self.assertTrue(urls(d)[0].endswith("&where=dashboard"))
 
     def test_ids_from_console_and_api_events(self):
+        account = publisher.ACCOUNT
+        analysis_arn = f"arn:aws-cn:quicksight:cn-north-1:{account}:analysis/a1"
+        dashboard_arn = f"arn:aws-cn:quicksight:cn-north-1:{account}:dashboard/d1"
         console = {"detail": {"requestParameters": None, "serviceEventDetails": {"eventRequestDetails": {
-            "dashboardId": "arn:aws-cn:quicksight:cn-north-1:1:dashboard/d1",
-            "analysisId": "arn:aws-cn:quicksight:cn-north-1:1:analysis/a1"}}}}
+            "dashboardId": dashboard_arn,
+            "analysisId": "a1"}}}}
         self.assertEqual(publisher.ids_from(console), ("d1", "a1"))
+        self.assertEqual(publisher._source_analysis_arn("a1"), analysis_arn)
+        self.assertEqual(publisher._source_analysis_arn(analysis_arn), analysis_arn)
         api = {"detail": {"requestParameters": {"dashboardId": "d2"}}}
         self.assertEqual(publisher.ids_from(api), ("d2", ""))
+
+        class QuickSight:
+            def list_dashboard_versions(self, **_):
+                return {"DashboardVersionSummaryList": [{"VersionNumber": 1}]}
+
+            def describe_dashboard_definition(self, **_):
+                return {"Definition": definition(CHAT), "Name": "D", "DashboardPublishOptions": {}}
+
+            def update_dashboard(self, **_):
+                return {"VersionArn": dashboard_arn + "/version/2"}
+
+            def update_dashboard_published_version(self, **_):
+                return None
+
+            def tag_resource(self, **_):
+                return None
+
+        first = {"Arn": dashboard_arn + "/version/1",
+                 "Version": {"VersionNumber": 1, "Status": "UPDATE_SUCCESSFUL", "SourceEntityArn": analysis_arn}}
+        final = {"Arn": dashboard_arn + "/version/2",
+                 "Version": {"VersionNumber": 2, "Status": "UPDATE_SUCCESSFUL", "SourceEntityArn": analysis_arn}}
+        with mock.patch.object(publisher, "qs", QuickSight()), \
+                mock.patch.object(publisher, "_settled", side_effect=[first, final]), \
+                mock.patch.object(publisher, "validated_analysis_arn", return_value=analysis_arn), \
+                mock.patch.object(publisher, "save_mapping") as save:
+            self.assertEqual(publisher.handler(console, None), {"dashboard": "d1", "changed": True, "version": 2})
+        self.assertEqual(save.call_args_list[-1].args, ("d1", dashboard_arn, analysis_arn, 2))
 
     def test_ids_from_first_console_publish(self):
         # CreateDashboard from the console names the new dashboard only in eventResponseDetails (CloudTrail, cn-north-1)

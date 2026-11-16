@@ -1,0 +1,9 @@
+# Complete CPython 3.12 Linux arm64 lock generated with pip 26.2.2.
+# Regenerate from tools-data.in and review every version and selected wheel hash.
+asn1crypto==1.5.1 --hash=sha256:db4e40728b728508912cbb3d44f19ce188f218e9eba635821bb4b68564f8fd67
+pg8000==1.31.5 --hash=sha256:0af2c1926b153307639868d2ee5cef6cd3a7d07448e12736989b10e1d491e201
+PyJWT==2.15.1 --hash=sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193
+PyMySQL==1.1.2 --hash=sha256:e6b1d89711dd51f8f74b1631fe08f039e7d76cf67a42a323d3178f0f25762ed9
+python-dateutil==4.0.0 --hash=sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c
+scramp==1.4.18 --hash=sha256:1b9c55c5dafb7fe19f6087158c6d2216d37b64f7cd68c2930cbe9ccf5b2c0979
+tzdata==2026.6 --hash=sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec

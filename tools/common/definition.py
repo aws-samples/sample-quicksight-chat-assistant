@@ -2,6 +2,8 @@
 what a visual plots in terms the data tool understands. Pure functions, no AWS calls."""
 
 import copy
+import datetime as dt
+import decimal
 import re
 
 # ifelse(${pX} = 'label', {column}, ..., default): the usual "pick a metric with a control" calculated field.
@@ -47,6 +49,15 @@ COLUMN_REFERENCE = re.compile(r"(?<!\$)\{([^{}]+)\}")  # {column} in a calculate
 STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.?)*(?:'|$)|\"(?:[^\"\\]|\\.?)*(?:\"|$)", re.S)
 
 
+def expression_columns(expression):
+    """Column names referenced by one calculated expression, excluding brace text in string literals."""
+    if not isinstance(expression, str):
+        return set()
+    code = STRING_LITERAL.sub("''", expression)
+    names = set(COLUMN_REFERENCE.findall(code)) | {column for _parameter, _label, column in SWITCH_BRANCH.findall(code)}
+    return {name.strip() for name in names}
+
+
 def referenced_columns(definition):
     """{dataset id: set of column names} the analysis uses: every {DataSetIdentifier, ColumnName} object anywhere in
     the definition (field wells, filters, controls, sorts, ...) plus the columns its calculated fields read outside
@@ -66,11 +77,302 @@ def referenced_columns(definition):
                 walk(value)
     walk(definition)
     for field in definition.get("CalculatedFields", []):
-        expression = field.get("Expression") or ""
-        if field.get("DataSetIdentifier") in ids and isinstance(expression, str):
-            code = STRING_LITERAL.sub("''", expression)  # brace text inside a literal ('{salary}') is not a reference
-            names = set(COLUMN_REFERENCE.findall(code)) | {c for _p, _l, c in SWITCH_BRANCH.findall(code)}
-            out.setdefault(ids[field["DataSetIdentifier"]], set()).update(n.strip() for n in names)
+        if field.get("DataSetIdentifier") in ids:
+            out.setdefault(ids[field["DataSetIdentifier"]], set()).update(expression_columns(field.get("Expression")))
+    return out
+
+
+class DefinitionUnsupported(ValueError):
+    """The definition contains a policy that direct source queries cannot reproduce exactly."""
+
+
+def viewer_columns(definition):
+    """Dataset id -> columns a viewer can discover or select from visuals and reachable controls.
+
+    Filter-only, sort-only and calculated-field dependency columns are intentionally excluded. They may still be
+    used internally to enforce mandatory predicates, but are never offered in a caller QuerySpec.
+    """
+    ids = dataset_ids(definition)
+    out = {}
+
+    def add(column):
+        if not isinstance(column, dict):
+            return
+        identifier, name = column.get("DataSetIdentifier"), column.get("ColumnName")
+        if identifier in ids and isinstance(name, str):
+            out.setdefault(ids[identifier], set()).add(name)
+
+    def walk(node):
+        if isinstance(node, dict):
+            add(node.get("Column"))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for _sheet, _visual, _kind, body in visuals(definition):
+        # Only field wells are viewer-visible query/edit inputs. Walking the whole visual would also admit columns
+        # used only by actions or other hidden visual configuration, contradicting this boundary.
+        walk((body.get("ChartConfiguration") or {}).get("FieldWells") or {})
+    for sheet in definition.get("Sheets", []):
+        for control in sheet.get("ParameterControls", []):
+            _kind, body = next(iter(control.items()))
+            add((body.get("SelectableValues") or {}).get("LinkToDataSetColumn"))
+    return out
+
+
+def cls_columns(dataset, caller_arns, candidates):
+    """Filter candidate names through QuickSight column-level permission rules after any shared cache read."""
+    candidates = set(candidates)
+    restricted, granted = set(), set()
+    principals = set(caller_arns)
+    for rule in dataset.get("ColumnLevelPermissionRules") or []:
+        names = set(rule.get("ColumnNames") or [])
+        restricted.update(names)
+        if principals & set(rule.get("Principals") or []):
+            granted.update(names)
+    return candidates - (restricted - granted)
+
+
+def _policy_value(value):
+    return value.isoformat() if hasattr(value, "isoformat") and callable(value.isoformat) else value
+
+
+def _parameter_specs(definition):
+    """Parameter declarations plus the controls a viewer can actually reach."""
+    out = {}
+    for declaration in definition.get("ParameterDeclarations", []):
+        kind, body = next(iter(declaration.items()))
+        defaults = body.get("DefaultValues") or {}
+        static = defaults.get("StaticValues") or []
+        multi = body.get("ParameterValueType") == "MULTI_VALUED"
+        default = list(static) if multi and static else (static[0] if static else None)
+        out[body["Name"]] = {"type": kind.replace("ParameterDeclaration", "").lower(),
+                             "default": default, "multi": multi, "controls": []}
+    for sheet in definition.get("Sheets", []):
+        for control in sheet.get("ParameterControls", []):
+            kind, body = next(iter(control.items()))
+            info = out.get(body.get("SourceParameterName"))
+            if info is not None:
+                info["controls"].append((kind, body))
+    return out
+
+
+def _coerce_parameter_scalar(info, value):
+    """Validate one URL-supplied value against its QuickSight declaration and return a bounded SQL operand."""
+    kind = info["type"]
+    if kind == "string":
+        if not isinstance(value, str) or len(value) > 500:
+            raise DefinitionUnsupported("分析控件的字符串值格式不正确")
+        return value
+    if kind == "integer":
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise DefinitionUnsupported("分析控件的整数值格式不正确")
+        if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value):
+            raise DefinitionUnsupported("分析控件的整数值格式不正确")
+        return int(value)
+    if kind == "decimal":
+        if isinstance(value, bool) or not isinstance(value, (int, float, decimal.Decimal, str)):
+            raise DefinitionUnsupported("分析控件的数值格式不正确")
+        try:
+            parsed = decimal.Decimal(str(value))
+        except decimal.InvalidOperation as error:
+            raise DefinitionUnsupported("分析控件的数值格式不正确") from error
+        if not parsed.is_finite():
+            raise DefinitionUnsupported("分析控件的数值格式不正确")
+        return format(parsed, "f")
+    if kind == "datetime":
+        value = _policy_value(value)
+        if not isinstance(value, str) or len(value) > 500:
+            raise DefinitionUnsupported("分析控件的日期时间值格式不正确")
+        try:
+            dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise DefinitionUnsupported("分析控件的日期时间值格式不正确") from error
+        return value
+    raise DefinitionUnsupported(f"分析参数类型 {kind} 无法精确复现")
+
+
+def _validated_parameter_value(info, value, check_choices):
+    if info["multi"]:
+        if not isinstance(value, list) or not 1 <= len(value) <= 200:
+            raise DefinitionUnsupported("分析控件的多选值格式不正确")
+        parsed = [_coerce_parameter_scalar(info, item) for item in value]
+    else:
+        if isinstance(value, list):
+            raise DefinitionUnsupported("分析控件的单选值格式不正确")
+        parsed = _coerce_parameter_scalar(info, value)
+    choices = []
+    if check_choices:
+        for _kind, control in info["controls"]:
+            listed = (control.get("SelectableValues") or {}).get("Values")
+            if listed:
+                choices.extend(_coerce_parameter_scalar(info, item) for item in listed)
+    selected = parsed if isinstance(parsed, list) else [parsed]
+    if choices and any(item not in choices for item in selected):
+        raise DefinitionUnsupported("分析控件的值不在已声明的静态选项中")
+    return parsed
+
+
+def _parameter_values(definition, supplied):
+    """Resolve fixed-filter parameters from complete declarations and validated viewer controls only."""
+    if supplied is not None and not isinstance(supplied, dict):
+        raise DefinitionUnsupported("分析控件参数格式不正确")
+    specs = _parameter_specs(definition)
+    values = {}
+    for name, info in specs.items():
+        if info["default"] is not None:
+            try:
+                values[name] = _validated_parameter_value(info, info["default"], False)
+            except DefinitionUnsupported:
+                pass  # a mandatory filter that needs this declaration will fail closed as missing below
+    for name, value in (supplied or {}).items():
+        if value in (None, ""):
+            continue
+        info = specs.get(name)
+        if info is None or not info["controls"]:
+            continue  # URL values cannot override hidden or undeclared parameters
+        select_all_visible = any(
+            (((control.get("DisplayOptions") or {}).get("SelectAllOptions") or {}).get("Visibility") == "VISIBLE")
+            for _kind, control in info["controls"])
+        supplied_all = is_all(value)
+        parsed = _validated_parameter_value(info, value, not supplied_all)
+        if supplied_all and not select_all_visible:
+            continue  # a crafted Select All value cannot replace the trusted declaration default
+        values[name] = parsed
+    return values
+
+
+def _static_or_parameter(value, parameter_values):
+    if not isinstance(value, dict):
+        return None, False
+    if "StaticValue" in value:
+        return _policy_value(value["StaticValue"]), True
+    parameter = value.get("Parameter")
+    if parameter and parameter in parameter_values:
+        return _policy_value(parameter_values[parameter]), True
+    return None, False
+
+
+def mandatory_filters(definition, dataset_id, supplied_parameters=None):
+    """Return enabled whole-analysis predicates for one dataset, or fail when exact reproduction is impossible."""
+    identifiers = dataset_ids(definition)
+    values = _parameter_values(definition, supplied_parameters)
+    out = []
+    for group in definition.get("FilterGroups", []):
+        status = group.get("Status", "ENABLED")
+        if status == "DISABLED":
+            continue
+        if status != "ENABLED":
+            raise DefinitionUnsupported("分析过滤器状态无法确认，直接查询已拒绝")
+        scope = group.get("ScopeConfiguration") or {}
+        if "AllSheets" not in scope:
+            raise DefinitionUnsupported("分析有只作用于部分工作表或图表的过滤器，直接查询无法确定同一作用域")
+        if group.get("CrossDataset", "SINGLE_DATASET") != "SINGLE_DATASET":
+            raise DefinitionUnsupported("分析有跨数据集过滤器，直接查询无法精确复现")
+        if group.get("Operator", "AND") != "AND":
+            raise DefinitionUnsupported("分析过滤器使用了 OR 组合，直接查询无法精确复现")
+        for wrapped in group.get("Filters") or []:
+            if not isinstance(wrapped, dict) or len(wrapped) != 1:
+                raise DefinitionUnsupported("分析包含无法识别的过滤器")
+            kind, body = next(iter(wrapped.items()))
+            column = body.get("Column") or {}
+            identifier, name = column.get("DataSetIdentifier"), column.get("ColumnName")
+            target = identifiers.get(identifier)
+            if target != dataset_id:
+                continue
+            if not isinstance(name, str):
+                raise DefinitionUnsupported("分析过滤器缺少数据列")
+            filters = []
+            null_option = body.get("NullOption")
+            if kind == "CategoryFilter":
+                configuration = body.get("Configuration") or {}
+                if "CustomFilterConfiguration" in configuration:
+                    item = configuration["CustomFilterConfiguration"] or {}
+                    null_option = item.get("NullOption")
+                    if item.get("ParameterName"):
+                        value, present = values.get(item["ParameterName"]), item["ParameterName"] in values
+                    else:
+                        value, present = item.get("CategoryValue"), "CategoryValue" in item
+                    if not present:
+                        raise DefinitionUnsupported("分析分类过滤器的参数没有可用值")
+                    if not is_all(value):
+                        operator = item.get("MatchOperator", "EQUALS")
+                        if operator not in ("EQUALS", "DOES_NOT_EQUAL"):
+                            raise DefinitionUnsupported("分析包含不支持的分类过滤运算")
+                        filters.append({"column": name, "op": "eq" if operator == "EQUALS" else "ne", "value": value})
+                elif "CustomFilterListConfiguration" in configuration or "FilterListConfiguration" in configuration:
+                    item = configuration.get("CustomFilterListConfiguration") or configuration.get("FilterListConfiguration") or {}
+                    null_option = item.get("NullOption")
+                    if item.get("ParameterName"):
+                        selected, present = values.get(item["ParameterName"]), item["ParameterName"] in values
+                    else:
+                        selected, present = item.get("CategoryValues"), "CategoryValues" in item
+                    if not present:
+                        raise DefinitionUnsupported("分析分类列表过滤器的参数没有可用值")
+                    if not is_all(selected):
+                        selected = selected if isinstance(selected, list) else [selected]
+                        if not 1 <= len(selected) <= 200:
+                            raise DefinitionUnsupported("分析分类列表过滤器超过 200 个值，直接查询不受支持")
+                        operator = item.get("MatchOperator", "CONTAINS")
+                        if operator not in ("EQUALS", "DOES_NOT_EQUAL", "CONTAINS", "DOES_NOT_CONTAIN"):
+                            raise DefinitionUnsupported("分析包含不支持的分类列表过滤运算")
+                        positive = operator in ("EQUALS", "CONTAINS")
+                        filters.append({"column": name, "op": "in" if positive else "not_in", "values": selected})
+                else:
+                    raise DefinitionUnsupported("分析包含无法复现的分类过滤器")
+            elif kind in ("TimeRangeFilter", "NumericRangeFilter"):
+                if kind == "TimeRangeFilter":
+                    if body.get("ExcludePeriodConfiguration"):
+                        raise DefinitionUnsupported("分析时间范围过滤器包含排除时段，直接查询无法精确复现")
+                    granularity = body.get("TimeGranularity")
+                    if granularity not in (None, "DAY", "SECOND", "MILLISECOND"):
+                        raise DefinitionUnsupported("分析时间范围过滤器的粒度无法精确复现")
+                elif body.get("AggregationFunction"):
+                    raise DefinitionUnsupported("分析数值范围过滤器使用聚合值，直接查询无法精确复现")
+                for key, inclusive, lower in (("RangeMinimumValue", body.get("IncludeMinimum", True), True),
+                                               ("RangeMaximumValue", body.get("IncludeMaximum", True), False)):
+                    if key not in body:
+                        continue
+                    value, present = _static_or_parameter(body.get(key), values)
+                    if not present:
+                        raise DefinitionUnsupported("分析范围过滤器的参数没有可用值")
+                    if kind == "TimeRangeFilter" and body.get("TimeGranularity") == "DAY":
+                        if not inclusive:
+                            raise DefinitionUnsupported("按天时间范围的排除端点无法精确复现")
+                        if isinstance(value, str):
+                            value = value[:10]
+                    op = ("gte" if inclusive else "gt") if lower else ("lte" if inclusive else "lt")
+                    filters.append({"column": name, "op": op, "value": value})
+            elif kind == "NumericEqualityFilter":
+                if body.get("AggregationFunction"):
+                    raise DefinitionUnsupported("分析数值等值过滤器使用聚合值，直接查询无法精确复现")
+                if body.get("ParameterName"):
+                    value, present = values.get(body["ParameterName"]), body["ParameterName"] in values
+                else:
+                    value, present = body.get("Value"), "Value" in body
+                if not present:
+                    raise DefinitionUnsupported("分析等值过滤器的参数没有可用值")
+                operator = body.get("MatchOperator", "EQUALS")
+                if operator not in ("EQUALS", "DOES_NOT_EQUAL"):
+                    raise DefinitionUnsupported("分析包含不支持的等值过滤运算")
+                filters.append({"column": name, "op": "eq" if operator == "EQUALS" else "ne", "value": value})
+            elif kind == "TimeEqualityFilter":
+                raise DefinitionUnsupported("分析包含带时间粒度的等值过滤器，直接查询无法精确复现")
+            else:
+                raise DefinitionUnsupported(f"分析包含无法复现的过滤器 {kind}")
+            if null_option == "NULLS_ONLY":
+                filters = [{"column": name, "op": "is_null"}]
+            elif null_option == "NON_NULLS_ONLY" and not filters:
+                filters = [{"column": name, "op": "not_null"}]
+            elif null_option == "ALL_VALUES" and filters:
+                raise DefinitionUnsupported("包含空值的过滤器需要 OR 语义，直接查询无法精确复现")
+            elif null_option is None:
+                raise DefinitionUnsupported("分析过滤器没有明确空值策略，直接查询无法精确复现")
+            elif null_option not in ("ALL_VALUES", "NON_NULLS_ONLY"):
+                raise DefinitionUnsupported("分析过滤器的空值策略无法复现")
+            out.extend(filters)
     return out
 
 
@@ -79,21 +381,11 @@ def calculated_fields(definition):
 
 
 def parameters(definition):
-    """Parameter name -> {type, default, control title, linked dataset column}."""
+    """Parameter name -> {type, complete static default, control title, linked dataset column}."""
     out = {}
-    for declaration in definition.get("ParameterDeclarations", []):
-        kind, body = next(iter(declaration.items()))
-        defaults = body.get("DefaultValues") or {}
-        static = defaults.get("StaticValues") or []
-        out[body["Name"]] = {"type": kind.replace("ParameterDeclaration", "").lower(),
-                             "default": static[0] if static else None,
-                             "multi": body.get("ParameterValueType") == "MULTI_VALUED"}
-    for sheet in definition.get("Sheets", []):
-        for control in sheet.get("ParameterControls", []):
-            kind, body = next(iter(control.items()))
-            info = out.get(body.get("SourceParameterName"))
-            if info is None:
-                continue
+    for name, spec in _parameter_specs(definition).items():
+        info = {"type": spec["type"], "default": spec["default"], "multi": spec["multi"]}
+        for kind, body in spec["controls"]:
             info["control"] = text({"FormatText": {"PlainText": body.get("Title", "")}}) or body.get("Title")
             info["control_type"] = kind
             link = (body.get("SelectableValues") or {}).get("LinkToDataSetColumn")
@@ -102,6 +394,7 @@ def parameters(definition):
             listed = (body.get("SelectableValues") or {}).get("Values")
             if listed:
                 info["choices"] = listed[:50]
+        out[name] = info
     return out
 
 
@@ -153,6 +446,7 @@ def parameter_filters(definition):
             binding = _filter_bindings(flt)
             if binding:
                 binding["visuals"] = sorted(visual_ids) if visual_ids is not None else "all"
+                binding["_mandatory"] = "AllSheets" in scope
                 out.append(binding)
     return out
 
@@ -237,7 +531,8 @@ def replace_chart_type(definition, visual_id, to_kind):
 
 def is_all(value):
     return value is None or (isinstance(value, str) and value.strip().lower() in ALL_SENTINELS) or \
-        (isinstance(value, str) and value.startswith("<<"))
+        (isinstance(value, str) and value.startswith("<<")) or \
+        (isinstance(value, list) and len(value) == 1 and is_all(value[0]))
 
 
 def resolve_switch(expression, parameter_values):
@@ -307,7 +602,8 @@ def preview_query(definition, visual_id, parameter_values):
         if target:  # output columns are named after their dataset column (see sqlcompile)
             query["order_by"] = [{"name": target, "desc": field_sort.get("Direction") == "DESC"}]
     for binding in parameter_filters(definition):
-        if binding["dataset"] != dataset or (binding["visuals"] != "all" and visual_id not in binding["visuals"]):
+        if binding["_mandatory"] or binding["dataset"] != dataset or \
+                (binding["visuals"] != "all" and visual_id not in binding["visuals"]):
             continue
         for role in binding["roles"]:
             value = (parameter_values or {}).get(role["parameter"])
@@ -324,11 +620,42 @@ def preview_query(definition, visual_id, parameter_values):
     return {"query": query, "notes": notes, "summary": summary}
 
 
-def strip_for_model(definition):
-    """A compact view of the analysis for the model (no layout, no formatting)."""
-    out = copy.deepcopy({"sheets": [], "parameters": parameters(definition), "filters": parameter_filters(definition),
-                         "datasets": dataset_ids(definition)})
-    for sheet in definition.get("Sheets", []):
-        out["sheets"].append({"name": sheet.get("Name"), "sheet_id": sheet.get("SheetId"),
-                              "visuals": [visual_summary(k, b, definition) for s, _v, k, b in visuals({"Sheets": [sheet]})]})
+def strip_for_model(definition, visible=None):
+    """A compact view of the analysis containing only the caller's post-CLS columns and related metadata."""
+    filters = parameter_filters(definition)
+    scoped = copy.deepcopy(definition)
+    if visible is not None:
+        allowed = lambda identifier, column: column in visible.get(identifier, set())
+        filters = [item for item in filters if allowed(item.get("dataset"), item.get("column"))]
+        allowed_parameters = {role["parameter"] for item in filters for role in item["roles"]}
+        for sheet in scoped.get("Sheets", []):
+            controls = []
+            for control in sheet.get("ParameterControls", []):
+                _kind, body = next(iter(control.items()))
+                link = (body.get("SelectableValues") or {}).get("LinkToDataSetColumn")
+                if link and not allowed(link.get("DataSetIdentifier"), link.get("ColumnName")):
+                    continue
+                controls.append(control)
+                if body.get("SourceParameterName"):
+                    allowed_parameters.add(body["SourceParameterName"])
+            sheet["ParameterControls"] = controls
+        model_parameters = {name: info for name, info in parameters(scoped).items() if name in allowed_parameters}
+    else:
+        model_parameters = parameters(scoped)
+    model_filters = [{key: value for key, value in item.items() if key != "_mandatory"} for item in filters]
+    out = {"sheets": [], "parameters": model_parameters, "filters": copy.deepcopy(model_filters),
+           "datasets": dataset_ids(definition)}
+    for sheet in scoped.get("Sheets", []):
+        summaries = [visual_summary(kind, body, scoped) for _sheet, _visual, kind, body
+                     in visuals({"Sheets": [sheet]})]
+        for summary in summaries:
+            if visible is not None:
+                for key in ("dimensions", "measures", "colors"):
+                    summary[key] = [field for field in summary[key]
+                                    if allowed(field.get("dataset"), field.get("column"))]
+            for field in summary["dimensions"] + summary["measures"] + summary["colors"]:
+                if "calculated" in field:
+                    field.pop("calculated")
+                    field["is_calculated"] = True
+        out["sheets"].append({"name": sheet.get("Name"), "sheet_id": sheet.get("SheetId"), "visuals": summaries})
     return out
