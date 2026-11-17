@@ -190,14 +190,20 @@ export class ChatAssistantStack extends Stack {
         const endpointSg = new ec2.SecurityGroup(this, 'EndpointSg', { vpc, description: `${prefix} interface endpoints` });
         endpointSg.addIngressRule(own, ec2.Port.tcp(443), 'data tools');
         own.addEgressRule(endpointSg, ec2.Port.tcp(443), 'owned AWS service endpoints');
-        const endpoint = (id: string, service: string, privateDnsEnabled: boolean) => new ec2.InterfaceVpcEndpoint(this, id, {
-          vpc, service: new ec2.InterfaceVpcEndpointService(`com.amazonaws.${this.region}.${service}`, 443),
+        const serviceNames = {
+          quicksight: `com.amazonaws.${this.region}.quicksight`,
+          secretsmanager: `com.amazonaws.${this.region}.secretsmanager`,
+          dynamodb: `com.amazonaws.${this.region}.dynamodb`,
+          rds: `${config.region.startsWith('cn-') ? 'cn.com.amazonaws' : 'com.amazonaws'}.${this.region}.rds`,
+        };
+        const endpoint = (id: string, serviceName: string, privateDnsEnabled: boolean) => new ec2.InterfaceVpcEndpoint(this, id, {
+          vpc, service: new ec2.InterfaceVpcEndpointService(serviceName, 443),
           subnets: { subnets }, securityGroups: [endpointSg], privateDnsEnabled,
         });
-        endpoint('QuickSightEndpoint', 'quicksight', true);
-        endpoint('SecretsEndpoint', 'secretsmanager', true);
-        const dynamodbEndpoint = endpoint('DynamoDbEndpoint', 'dynamodb', false);
-        const rdsEndpoint = endpoint('RdsEndpoint', 'rds', false);
+        endpoint('QuickSightEndpoint', serviceNames.quicksight, true);
+        endpoint('SecretsEndpoint', serviceNames.secretsmanager, true);
+        const dynamodbEndpoint = endpoint('DynamoDbEndpoint', serviceNames.dynamodb, false);
+        const rdsEndpoint = endpoint('RdsEndpoint', serviceNames.rds, false);
         const endpointUrl = (value: string[]) =>
           `https://${Fn.select(1, Fn.split(':', Fn.select(0, value)))}`;
         // DynamoDB does not provide private DNS for interface endpoints. RDS China interface endpoints use a separate
