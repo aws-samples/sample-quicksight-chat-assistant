@@ -201,6 +201,18 @@ def apply_preview(c, token, result, label):
     return body
 
 
+def confirm_undo(c, token, session, label):
+    result = c.ask(token, "撤销", session=session)
+    actions = [action for action in result.get("actions") or [] if action.get("type") == "undo_last_visual_change"]
+    called = [step for step in tools(result) if step[0] == "undo_last_visual_change"]
+    check(f"{label}: confirmation action returned", bool(actions), result.get("actions") or [])
+    check(f"{label}: tool not called before confirmation", not called, called)
+    force = bool(actions and actions[0].get("force") is True)
+    status, body = qsca.http("POST", f"{c.base}/changes/undo", token,
+                             {"analysis": c.analysis, "force": force})
+    check(f"{label}: confirmed undo", status == 200 and body.get("undone") is True, body)
+
+
 def test_edits(c, args):
     print("==> add / retitle / delete a visual, then undo all three")
     if not (args.dataset_identifier and args.category_column and args.measure_column):
@@ -222,8 +234,7 @@ def test_edits(c, args):
     apply_preview(c, token, r, "delete_visual")
     check("visual deleted", all(v[0] != new_id for v in c.visuals()), "")
     for i in range(3):
-        r = c.ask(token, "撤销", session=session)
-        check(f"undo {i + 1}", ("undo_last_visual_change", True) in tools(r), tools(r))
+        confirm_undo(c, token, session, f"undo {i + 1}")
     check("analysis back to the original visuals", c.visuals() == original,
           [v for v in c.visuals() if v not in original] or "")
 
@@ -272,8 +283,7 @@ def test_preview_apply_undo(c, args):
     check("analysis changed", c.visual_type(args.visual) == want, c.visual_type(args.visual))
     status, body = qsca.http("POST", f"{c.base}/changes/{change}/apply", token, {"analysis": c.analysis})
     check("second apply refused", status == 409, body)
-    r = c.ask(token, "撤销", session=session)
-    check("undo via chat", ("undo_last_visual_change", True) in tools(r), tools(r))
+    confirm_undo(c, token, session, "undo")
     check("analysis restored", c.visual_type(args.visual) == before, c.visual_type(args.visual))
 
 
