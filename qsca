@@ -280,6 +280,18 @@ def chat_url(base, analysis_id, parameter_names, viewer):
     return base.rstrip("/") + "/?" + "&".join(parts)
 
 
+def chat_binding(url, base, analysis_id):
+    """Whether a chat visual URL targets this deployment and exactly this analysis."""
+    try:
+        actual, expected = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        same_endpoint = ((actual.scheme, actual.netloc, actual.path) ==
+                         (expected.scheme, expected.netloc, expected.path) and not actual.fragment)
+        analyses = urllib.parse.parse_qs(actual.query, keep_blank_values=True).get("analysis", [])
+        return same_endpoint and analyses == [analysis_id]
+    except (TypeError, ValueError):
+        return False
+
+
 def cmd_publish(args):
     """Publish an analysis as a dashboard whose chat knows it is in a dashboard (where=dashboard in its URL).
 
@@ -437,9 +449,14 @@ def cmd_check(args):
         qs = s.client("quicksight")
         account = s.client("sts").get_caller_identity()["Account"]
         definition = qs.describe_analysis_definition(AwsAccountId=account, AnalysisId=args.analysis)["Definition"]
-        visual = [v for sh in definition.get("Sheets", []) for v in sh.get("Visuals", [])
-                  if next(iter(v.values())).get("VisualId") == CHAT_VISUAL_ID]
-        report(bool(visual), "分析里已有聊天窗口" if visual else "分析里没有聊天窗口：./qsca attach <分析ID> --apply")
+        visuals = [next(iter(v.values())) for sh in definition.get("Sheets", []) for v in sh.get("Visuals", [])
+                   if next(iter(v.values())).get("VisualId") == CHAT_VISUAL_ID]
+        report(bool(visuals), "分析里已有聊天窗口" if visuals else "分析里没有聊天窗口：./qsca attach <分析ID> --apply")
+        if visuals:
+            urls = [(visual.get("ChartConfiguration") or {}).get("ContentUrl") or "" for visual in visuals]
+            bound = all(chat_binding(url, out["ChatUrl"], args.analysis) for url in urls)
+            report(bound, "聊天窗口已绑定到当前分析" if bound else
+                   f"聊天窗口仍指向其他分析或地址无效：./qsca attach {args.analysis} --apply")
         prefix = config["dataAccess"]["datasourceSecretPrefix"]
         for declaration in definition.get("DataSetIdentifierDeclarations", []):
             dataset = qs.describe_data_set(AwsAccountId=account, DataSetId=declaration["DataSetArn"].rsplit("/", 1)[-1])["DataSet"]

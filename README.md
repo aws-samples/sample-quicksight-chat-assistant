@@ -241,6 +241,10 @@ analysis. When parameters are added or removed later, the chat offers **更新�
 ./qsca --profile <p> attach <analysis-id> --apply    # add the chat visual (backup saved under build/)
 ```
 
+**After Save As or any API copy**, run `attach <new-analysis-id> --apply` on the copy. QuickSight copies a custom
+visual's literal `ContentUrl`; it cannot infer that the `analysis=...` query parameter must change. `check --analysis`
+and the e2e auth stage fail when a copied visual still points to its source analysis.
+
 The URL carries every analysis parameter (`?analysis=<id>&p.<name>=<<$name>>…`) so the chat knows the current control
 values. Options: `--sheet <id>`, `--replace <visual_id>` (take an existing visual's place). Re-run after adding or
 removing parameters, then publish the dashboard with
@@ -697,6 +701,10 @@ DynamoDB 和 RDS API 的端点专用 URL；为 `false` 时必须提供全部端�
 ./qsca --profile <p> attach <analysis-id>            # 只打印嵌入地址
 ./qsca --profile <p> attach <analysis-id> --apply    # 把聊天可视对象加进分析（备份保存在 build/）
 ```
+
+**每次“另存为”或通过 API 复制分析后**，都要对副本运行 `attach <新-analysis-id> --apply`。QuickSight 会原样复制
+自定义可视对象的 `ContentUrl`，不知道其中的 `analysis=...` 必须改成副本 ID。`check --analysis` 和 e2e 的认证阶段会在
+副本仍指向源分析时失败。
 
 地址带上了分析的全部参数（`?analysis=<id>&p.<name>=<<$name>>…`），聊天窗口由此知道当前控件值。选项：`--sheet <id>`、
 `--replace <visual_id>`（占用某个已有可视对象的位置）。增删参数后重新运行，然后用下面的命令发布仪表盘

@@ -115,6 +115,12 @@ def tools(result):
 def test_auth(c, args):
     """Read-only: token audiences, analysis binding, sign-out revocation, page CSP, login redirect."""
     print("==> auth")
+    definition = c.definition()
+    chat_urls = [((v.get("CustomContentVisual") or {}).get("ChartConfiguration") or {}).get("ContentUrl", "")
+                 for sheet in definition.get("Sheets", []) for v in sheet.get("Visuals", [])
+                 if (v.get("CustomContentVisual") or {}).get("VisualId") == qsca.CHAT_VISUAL_ID]
+    check("chat visual bound to the tested analysis",
+          bool(chat_urls) and all(qsca.chat_binding(url, c.out["ChatUrl"], c.analysis) for url in chat_urls), chat_urls)
     for label, header in (("no token", None), ("forged token", "x.y")):
         status, _ = qsca.http("POST", f"{c.base}/chat", header or "", {"prompt": "hi", "analysis": c.analysis})
         check(f"{label} -> 401", status == 401, status)
