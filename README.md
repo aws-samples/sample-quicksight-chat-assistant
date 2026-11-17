@@ -465,6 +465,10 @@ model call that runs longer than 20 s, `model_retry` the automatic retries).
 - The chat cannot change controls; the editor does not refresh after an applied change; unsaved manual edits in the
   editor and an applied change can overwrite each other.
 - Cancelling while the model is still "thinking" stops at the end of that step (seconds to tens of seconds).
+- Browser support: sign-in works in Chrome, Edge and other Chromium-based browsers, which accept the partitioned
+  session cookie inside the QuickSight iframe. Safari with "Prevent cross-site tracking" enabled (the default) blocks
+  that cookie, so sign-in does not complete; the chat stays signed out (it fails closed). Do not ask users to turn off
+  that setting. Support through the Storage Access API is not implemented yet.
 
 ## Development
 
@@ -901,6 +905,9 @@ Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
 - 使用计算字段的可视对象，只有参数切换型字段（`ifelse(${p} = '…', {col}, …)`）能预览。
 - 聊天不能修改控件；应用修改后编辑界面不会自动刷新；编辑界面里未保存的手动修改与已应用的修改可能互相覆盖。
 - 模型还在“思考”时取消，会在这一步结束时停止（几秒到几十秒）。
+- 浏览器支持：Chrome、Edge 等 Chromium 内核浏览器可以在 QuickSight 的 iframe 中使用分区会话 Cookie，能正常登录。
+  Safari 默认开启“防止跨站跟踪”，会拦截该 Cookie，登录无法完成，聊天保持未登录状态（失败即拒绝）。不要要求用户
+  关闭这项设置。通过 Storage Access API 支持 Safari 尚未实现。
 
 ## 开发
 
