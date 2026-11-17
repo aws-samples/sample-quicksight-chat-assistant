@@ -5,7 +5,8 @@ Routes:
   GET  /static/<file>          render.js, app.js and the vendored ECharts / marked / DOMPurify, versioned names,
                                cached for a year
   GET  /auth/login             start IAM Identity Center SAML login (popup)
-  POST /saml/acs               SAML assertion consumer; sets an opaque HttpOnly browser-session cookie
+  POST /saml/acs               SAML assertion consumer; creates an opaque browser session and one-time exchange
+  POST /auth/exchange          adopt that session in the embedding site's partitioned HttpOnly cookie
   POST /auth/logout            sign out: revoke this browser session and cancel its running answers
   GET  /me                     who is signed in and the browser session's CSRF token
   POST /chat                   submit a question: stored as a job, sent to the Runtime, which acknowledges at once
@@ -180,8 +181,9 @@ def csrf_matches(event, user):
     return user.get("_auth_type") != "browser" or secrets.compare_digest(header(event, CSRF_HEADER), user.get("csrf") or "")
 
 
-def session_cookie(value, max_age):
-    return f"{BROWSER_COOKIE}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=None"
+def session_cookie(value, max_age, partitioned=False):
+    suffix = "; Partitioned" if partitioned else ""
+    return f"{BROWSER_COOKIE}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=None{suffix}"
 
 
 def acs_url(event):
@@ -225,6 +227,7 @@ def login_finish(event):
         _token, payload, nonce, _attributes = auth.complete_login(
             jobs, (form.get("SAMLResponse") or [""])[0], (form.get("RelayState") or [""])[0], acs_url(event))
         session_id, _csrf = auth.create_browser_session(jobs, payload)
+        exchange = auth.create_browser_exchange(jobs, session_id, payload["exp"])
     except auth.AuthError as error:
         print(json.dumps({"auth": "rejected", **logging_utils.exception_fields(error)}, ensure_ascii=False))
         return popup(403, "登录失败", str(error))
@@ -233,8 +236,22 @@ def login_finish(event):
         return popup(500, "登录失败", "签名或断言校验出错，请稍后重试。")
     print(json.dumps({"auth": "ok", "user": _uref(payload["sub"]), "exp": payload["exp"],
                       "name_source": payload.get("name_source")}, ensure_ascii=False))
-    response = popup(200, "登录成功", "正在返回聊天窗口…", {"type": "qsca-auth", "nonce": nonce}, origin(event))
+    response = popup(200, "登录成功", "正在返回聊天窗口…",
+                     {"type": "qsca-auth", "nonce": nonce, "exchange": exchange}, origin(event))
     response["cookies"] = [session_cookie(session_id, max(int(payload["exp"]) - int(time.time()), 0))]
+    return response
+
+
+def login_exchange(event):
+    """Set the session as a partitioned cookie from the embedded page's own response context."""
+    try:
+        body = request_json(event, 1024)
+        session_id, session_expiry = auth.consume_browser_exchange(jobs, body.get("exchange"))
+    except (ValueError, auth.AuthError) as error:
+        print(json.dumps({"auth": "exchange_rejected", **logging_utils.exception_fields(error)}, ensure_ascii=False))
+        return respond(401, {"error": "登录交换码无效或已过期，请重新登录。"})
+    response = respond(200, {"ok": True})
+    response["cookies"] = [session_cookie(session_id, max(session_expiry - int(time.time()), 0), partitioned=True)]
     return response
 
 
@@ -267,7 +284,7 @@ def logout(event, user):
     print(json.dumps({"auth": "logout", "user": _uref(user["sub"]), "cancelled": cancelled}))
     response = respond(200, {"ok": True, "cancelled": cancelled})
     if user.get("_auth_type") == "browser":
-        response["cookies"] = [session_cookie("", 0)]
+        response["cookies"] = [session_cookie("", 0), session_cookie("", 0, partitioned=True)]
     return response
 
 
@@ -517,6 +534,8 @@ def handler(event, context):
         return login_start(event)
     if method == "POST" and path == "/saml/acs":
         return login_finish(event)
+    if method == "POST" and path == "/auth/exchange":
+        return login_exchange(event)
     user = current_user(event)
     if not user:
         return respond(401, {"error": "unauthorized", "login": True})

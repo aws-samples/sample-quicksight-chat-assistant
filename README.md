@@ -313,11 +313,12 @@ Migrating from a version before the security hardening (see [docs/security-threa
   `./qsca datasource-secret` for every data source after deploying; old username/password-only records fail closed.
 - Built-in queries refuse either RLS form unless explicitly disabled, apply caller CLS, expose only visual/control
   columns from the authorized analysis or dashboard definition, and enforce reproducible whole-analysis filters.
-- Browser authentication now uses a server-side opaque session referenced by a `Secure; HttpOnly; SameSite=None`
-  `__Host-qsca-session` cookie. The popup sends no credential to page script. The page reads identity and a separate
-  CSRF token from `/me`; every authenticated POST must present that token. Existing browser bearer sessions stop
-  working after deployment, so users sign in again. **退出** deletes the opaque session, revokes derived tool tokens
-  and cancels that sign-in's running answers.
+- Browser authentication now uses a server-side opaque session. After SAML validation, the popup sends only a
+  short-lived one-time exchange code to the page; `/auth/exchange` sets the `Secure; HttpOnly; SameSite=None;
+  Partitioned` `__Host-qsca-session` cookie in the embedding site's partition. JavaScript never receives the session
+  ID. The page reads identity and a separate CSRF token from `/me`; every authenticated POST must present that token.
+  Existing browser bearer sessions stop working after deployment, so users sign in again. **退出** deletes the opaque
+  session, clears both cookie forms, revokes derived tool tokens and cancels that sign-in's running answers.
 
 ## Use
 
@@ -384,7 +385,7 @@ Limits: 8 groups, 20 questions per group, 200 characters per question. Changes a
 | Topic | Mechanism |
 |---|---|
 | Sign-in | Only users assigned to the Identity Center app; SAML assertions checked for signature (against every signing certificate in the app metadata, so a certificate rotation keeps working), issuer, audience, ACS, request ID, validity and replay; assertions without an ID are refused |
-| Session | The browser receives only an opaque random ID in a `Secure; HttpOnly; SameSite=None; Path=/` `__Host-qsca-session` cookie; claims and a separate CSRF token live in DynamoDB. `/me` returns identity and the CSRF token, and every authenticated POST requires it. The session lasts 1 hour by default (`sessionSeconds`). The signed HS256 session JWT path remains only for the administrator `qsca smoke` command; **退出** deletes and revokes the browser session and cancels its running answers |
+| Session | The browser session is a random opaque ID stored only in `Secure; HttpOnly` cookies; claims and a separate CSRF token live in DynamoDB. After SAML, the popup returns a short-lived one-time exchange code, and `/auth/exchange` sets the `SameSite=None; Partitioned; Path=/` `__Host-qsca-session` cookie in the QuickSight site's partition without exposing the session ID to JavaScript. `/me` returns identity and the CSRF token, and every authenticated POST requires it. The session lasts 1 hour by default (`sessionSeconds`). The signed HS256 session JWT path remains only for the administrator `qsca smoke` command; **退出** deletes and revokes the browser session, clears both cookie forms and cancels its running answers |
 | Chat page | Content-Security-Policy: scripts only from the page's own origin (no inline script, content-hashed file names), requests only to its API, no plugins or form posts. `frameAncestors` accepts only unique exact HTTPS origins, without wildcards, paths, credentials, query strings or fragments. Styles allow inline declarations for ECharts tooltips. The page builds its UI with DOM nodes (text, never HTML strings); Markdown goes through one DOMPurify boundary, without images, iframes, styles, classes, `div` or `span` |
 | Who sees data | Users need `DescribeAnalysis`, or `DescribeDashboard` on a dashboard with exact QuickSight source provenance or a version-bound application mapping. Dashboard-only users get that published dashboard definition, never the live analysis draft. Tags do not authorize. The signed-in email must match exactly one active QuickSight user |
 | Dataset rules | Dataset and tag RLS must be explicitly disabled; dataset filters, joins and custom SQL are refused. Caller CLS is applied after cache reads. Only visual/reachable-control columns are discoverable or included in model-visible visual, filter, control and parameter metadata; calculated fields with a CLS-denied dependency are omitted. Mandatory-filter columns remain policy-only only when CLS permits them, and control overrides require declaration type/multiplicity/static-choice validation. Credentials are bound to an approved target and verified TLS session |
@@ -759,9 +760,11 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
   `./qsca datasource-secret`；旧的只有用户名/密码的记录会拒绝使用。
 - 内置查询只有在两种 RLS 都明确关闭时才执行；按调用者应用列级权限，只提供获授权分析或仪表盘定义里的图表/控件列，并强制执行
   可精确复现的全分析筛选。
-- 浏览器认证改为服务端不透明会话，由 `Secure; HttpOnly; SameSite=None` 的 `__Host-qsca-session` Cookie
-  引用。弹窗不会向页面脚本发送凭证；页面从 `/me` 读取身份和单独的 CSRF 令牌，每个已认证 POST 都必须携带该令牌。部署后旧的
-  浏览器 Bearer 会话会失效，用户需重新登录。**退出** 会删除不透明会话、吊销派生工具令牌并取消这次登录正在运行的回答。
+- 浏览器认证改为服务端不透明会话。SAML 校验完成后，弹窗只向页面发送一个短期、一次性的交换码；页面调用
+  `/auth/exchange`，在 QuickSight 所在的分区中设置 `Secure; HttpOnly; SameSite=None; Partitioned` 的
+  `__Host-qsca-session` Cookie，JavaScript 不会拿到会话 ID。页面再从 `/me` 读取身份和单独的 CSRF 令牌，每个已认证 POST
+  都必须携带该令牌。部署后旧的浏览器 Bearer 会话会失效，用户需重新登录。**退出** 会删除不透明会话、清除两种 Cookie、
+  吊销派生工具令牌并取消这次登录正在运行的回答。
 
 ## 使用
 
@@ -819,7 +822,7 @@ VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用�
 | 方面 | 机制 |
 |---|---|
 | 登录 | 只有分配到 Identity Center 应用的用户；SAML 断言校验签名（逐一对照应用元数据里的每张签名证书，证书轮换期间也能登录）、颁发者、受众、ACS、请求 ID、有效期和重放；没有 ID 的断言拒绝 |
-| 会话 | 浏览器只收到 `Secure; HttpOnly; SameSite=None; Path=/` 的 `__Host-qsca-session` Cookie 中的随机不透明 ID；声明和单独的 CSRF 令牌保存在 DynamoDB。`/me` 返回身份和 CSRF 令牌，每个已认证 POST 都必须校验它。默认有效 1 小时（`sessionSeconds`）。HS256 会话 JWT 路径仅为管理员 `qsca smoke` 保留；点 **退出** 会删除并吊销浏览器会话、取消正在运行的回答 |
+| 会话 | 浏览器会话是只存在于 `Secure; HttpOnly` Cookie 中的随机不透明 ID，声明和单独的 CSRF 令牌保存在 DynamoDB。SAML 完成后，弹窗返回短期的一次性交换码，`/auth/exchange` 在 QuickSight 站点的分区中设置 `SameSite=None; Partitioned; Path=/` 的 `__Host-qsca-session` Cookie，不向 JavaScript 暴露会话 ID。`/me` 返回身份和 CSRF 令牌，每个已认证 POST 都必须校验它。默认有效 1 小时（`sessionSeconds`）。HS256 会话 JWT 路径仅为管理员 `qsca smoke` 保留；点 **退出** 会删除并吊销浏览器会话、清除两种 Cookie、取消正在运行的回答 |
 | 聊天页 | Content-Security-Policy：脚本只能来自页面自己的来源（没有内联脚本，文件名带内容哈希），请求只能发往它的 API，不允许插件和表单提交。`frameAncestors` 只接受不重复的准确 HTTPS 来源，不允许通配符、路径、凭证、查询或片段。样式允许内联声明（ECharts 提示框需要）。页面用 DOM 节点构建界面（文本，从不拼 HTML 字符串）；Markdown 只经过一个 DOMPurify 净化边界，不允许图片、iframe、样式、class、`div` 和 `span` |
 | 谁能看数据 | 用户要么有分析的 `DescribeAnalysis`，要么有具备准确 QuickSight 来源或版本绑定应用映射的仪表盘 `DescribeDashboard`。只有仪表盘权限的用户只得到已发布仪表盘定义，不能读取实时分析草稿；标签不参与授权。登录邮箱必须恰好对应一个活跃 QuickSight 用户 |
 | 数据集规则 | 数据集 RLS 和标签 RLS 都必须明确关闭；数据集筛选、联接和自定义 SQL 会拒绝。缓存后按调用者应用列级权限，只暴露图表/可达控件列，强制筛选列只在策略内部使用；凭证绑定到批准目标和经过验证的 TLS 会话 |

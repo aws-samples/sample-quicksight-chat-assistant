@@ -294,10 +294,12 @@ function startLogin() {
   const onMessage = (event) => {
     if (event.origin !== location.origin || event.source !== popup) return;
     const data = event.data || {};
-    if (data.type !== "qsca-auth" || data.nonce !== nonce) return;
+    if (data.type !== "qsca-auth" || data.nonce !== nonce || typeof data.exchange !== "string") return;
     done = true;
     window.removeEventListener("message", onMessage);
-    bootstrapIdentity(true).catch(() => {});
+    api("/auth/exchange", { method: "POST", body: JSON.stringify({ exchange: data.exchange }) })
+      .then(() => bootstrapIdentity(true))
+      .catch((error) => { note.textContent = `登录未完成：${error.message}`; });
   };
   window.addEventListener("message", onMessage);
   const watch = setInterval(() => {

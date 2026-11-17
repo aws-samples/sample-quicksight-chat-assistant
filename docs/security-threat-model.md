@@ -34,13 +34,15 @@ available.
    assertion, verifies its signature against every signing certificate in the stored metadata, and checks issuer,
    audience, ACS recipient, request binding, validity, assertion ID and replay state.
 3. After validation, the web Lambda creates a random opaque browser session. DynamoDB stores its claims, expiry, `jti`
-   and a separate random CSRF token under a SHA-256-derived `browser-session#...` key. The response sets only
-   `__Host-qsca-session=<opaque-id>; Secure; HttpOnly; SameSite=None; Path=/`; the popup sends no credential through
-   `postMessage`.
-4. The page calls `/me` with the cookie to obtain display identity and the CSRF token. Every authenticated `POST`
-   requires `x-csrf-token` to match the server-side session. `GET` routes remain non-mutating.
+   and a separate random CSRF token under a SHA-256-derived `browser-session#...` key. The popup receives an
+   unpartitioned `Secure; HttpOnly; SameSite=None` cookie for top-level use and sends only a short-lived, single-use
+   exchange code through `postMessage`; it never exposes the session ID or CSRF token to JavaScript.
+4. The embedded page consumes that code at `/auth/exchange`. The response sets
+   `__Host-qsca-session=<opaque-id>; Secure; HttpOnly; SameSite=None; Partitioned; Path=/` in the QuickSight top-level
+   site's cookie partition. The page then calls `/me` to obtain display identity and the CSRF token. Every authenticated
+   `POST` requires `x-csrf-token` to match the server-side session. `GET` routes remain non-mutating.
 5. `POST /auth/logout` deletes the opaque browser session, writes `revoked#<jti>` long enough to cover derived tool
-   tokens, clears the cookie and attempts to cancel remembered jobs.
+   tokens, clears both cookie forms and attempts to cancel remembered jobs.
 
 A signed HS256 `qsca:session` JWT remains only for the administrator `qsca smoke` path and unit compatibility. Browser
 JavaScript never receives or stores it. Tool JWTs use a separate `<prefix>/tool-key`, are bound to user, analysis and

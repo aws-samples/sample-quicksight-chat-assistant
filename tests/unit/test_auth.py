@@ -4,6 +4,7 @@ skipped unless signxml and lxml are installed. No AWS calls: secrets, QuickSight
 
 import base64
 import datetime as dt
+from decimal import Decimal
 import importlib.util
 import io
 import json
@@ -223,8 +224,10 @@ class FakeTable:
             item[names.get(name, name)] = values[value]
         return {}
 
-    def delete_item(self, Key, ReturnValues=None, ConditionExpression=None):  # noqa: N803
-        if Key["jobId"] not in self.items:
+    def delete_item(self, Key, ReturnValues=None, ConditionExpression=None, ExpressionAttributeValues=None):  # noqa: N803
+        item = self.items.get(Key["jobId"])
+        values = ExpressionAttributeValues or {}
+        if item is None or (ConditionExpression == "expiresAt > :now" and item.get("expiresAt", 0) <= values[":now"]):
             raise self._Exceptions.ConditionalCheckFailedException()
         return {"Attributes": self.items.pop(Key["jobId"])}
 
@@ -330,6 +333,19 @@ class SamlTest(unittest.TestCase):
         with self.assertRaises(tokens.InvalidToken):  # signed with the tool key, not the session key
             tokens.verify(KEY, tool, tokens.TOOLS_AUDIENCE)
 
+    def test_browser_session_exchange_is_short_lived_and_one_time(self):
+        table = FakeTable()
+        session_id = "s" * 43
+        session_expiry = int(time.time()) + 300
+        exchange = auth.create_browser_exchange(table, session_id, session_expiry)
+        self.assertEqual(auth.consume_browser_exchange(table, exchange), (session_id, session_expiry))
+        with self.assertRaisesRegex(auth.AuthError, "expired or already used"):
+            auth.consume_browser_exchange(table, exchange)
+        expired = auth.create_browser_exchange(table, session_id, session_expiry)
+        table.items[auth._browser_exchange_key(expired)["jobId"]]["expiresAt"] = int(time.time()) - 1
+        with self.assertRaisesRegex(auth.AuthError, "expired or already used"):
+            auth.consume_browser_exchange(table, expired)
+
     def test_rejects_doctype_external_entities_and_entity_expansion(self):
         xxe = b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
         laughs = b'<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">]>'
@@ -400,6 +416,36 @@ class WebLogoutTest(unittest.TestCase):
         return self.web.handler({"requestContext": {"http": {"method": method}, "domainName": "chat.example.com"},
                                  "rawPath": path, "headers": {"authorization": f"Bearer {self.token}"},
                                  "body": json.dumps(body) if body is not None else ""}, None)
+
+    def test_browser_session_dynamodb_numbers_serialize_in_me_response(self):
+        session_id, csrf = auth.create_browser_session(self.table, self.claims)
+        item = self.table.items[auth._browser_session_key(session_id)["jobId"]]
+        item["iat"], item["exp"] = Decimal(item["iat"]), Decimal(item["exp"])
+        response = self.web.handler({
+            "requestContext": {"http": {"method": "GET"}, "domainName": "chat.example.com"},
+            "rawPath": "/me", "headers": {"cookie": f"{self.web.BROWSER_COOKIE}={session_id}"}, "body": "",
+        }, None)
+        body = json.loads(response["body"])
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual((body["sub"], body["csrf"]), (self.claims["sub"], csrf))
+        self.assertIsInstance(body["exp"], int)
+
+    def test_browser_exchange_sets_a_partitioned_httponly_cookie_once(self):
+        session_id, _csrf = auth.create_browser_session(self.table, self.claims)
+        exchange = auth.create_browser_exchange(self.table, session_id, self.claims["exp"])
+        event = {
+            "requestContext": {"http": {"method": "POST"}, "domainName": "chat.example.com"},
+            "rawPath": "/auth/exchange", "headers": {"content-type": "application/json"},
+            "body": json.dumps({"exchange": exchange}),
+        }
+        response = self.web.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(len(response["cookies"]), 1)
+        cookie = response["cookies"][0]
+        self.assertIn(f"{self.web.BROWSER_COOKIE}={session_id};", cookie)
+        self.assertIn("; Secure; HttpOnly; SameSite=None; Partitioned", cookie)
+        self.assertNotIn(session_id, response["body"])
+        self.assertEqual(self.web.handler(event, None)["statusCode"], 401)
 
     def test_logout_cancels_running_jobs_and_revokes_tool_tokens(self):
         ids = [json.loads(self.call("POST", "/chat", {"prompt": "趋势", "analysis": "a1"})["body"])["jobId"]

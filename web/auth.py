@@ -10,8 +10,9 @@ All XML parsing goes through _parse_xml: a parser that resolves no entities, loa
 any document with a DOCTYPE is refused. The AuthnRequest is built with lxml element APIs, never by string formatting.
 
 Flow: the chat iframe opens a popup at /auth/login?nonce=..., which redirects to Identity Center with an
-AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the response sets a Secure,
-HttpOnly cookie and tells the iframe only that login completed. The iframe reads identity and CSRF state from /me.
+AuthnRequest. Identity Center posts a signed assertion to /saml/acs. After validation the response creates a Secure,
+HttpOnly session and sends the opener a short-lived one-time exchange code. The iframe consumes that code at
+/auth/exchange, which sets the cookie in the embedding site's partition, then reads identity and CSRF state from /me.
 Sign-out deletes the opaque session and records its jti until all derived tool tokens expire.
 """
 
@@ -49,6 +50,7 @@ TOOL_SECRET_ID = os.environ["TOOL_SECRET_ID"]
 IDP_METADATA_PARAMETER = os.environ["IDP_METADATA_PARAMETER"]
 SESSION_SECONDS = int(os.environ.get("SESSION_SECONDS", "3600"))
 LOGIN_SECONDS = 600
+EXCHANGE_SECONDS = 60
 CLOCK_SKEW = dt.timedelta(minutes=3)
 SAFE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False, dtd_validation=False,
                               huge_tree=False, remove_comments=True, remove_pis=True)
@@ -158,14 +160,56 @@ def create_browser_session(table, claims):
     return session_id, csrf
 
 
+def _browser_exchange_key(exchange):
+    digest = hashlib.sha256(exchange.encode("ascii")).hexdigest()
+    return {"jobId": f"saml#exchange#{digest}"}
+
+
+def create_browser_exchange(table, session_id, session_expiry):
+    """Return a short-lived one-time code that lets the embedded page adopt the HttpOnly browser session."""
+    exchange = secrets.token_urlsafe(32)
+    now = int(time.time())
+    table.put_item(Item={**_browser_exchange_key(exchange), "sessionId": session_id,
+                         "sessionExp": int(session_expiry), "createdAt": now, "expiresAt": now + EXCHANGE_SECONDS})
+    return exchange
+
+
+def consume_browser_exchange(table, exchange):
+    """Consume one valid exchange code and return its browser session id and expiry."""
+    if not isinstance(exchange, str) or not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", exchange):
+        raise AuthError("invalid browser session exchange")
+    try:
+        item = table.delete_item(
+            Key=_browser_exchange_key(exchange), ReturnValues="ALL_OLD",
+            ConditionExpression="expiresAt > :now", ExpressionAttributeValues={":now": int(time.time())},
+        ).get("Attributes") or {}
+    except table.meta.client.exceptions.ConditionalCheckFailedException as error:
+        raise AuthError("browser session exchange expired or already used") from error
+    session_id = item.get("sessionId")
+    try:
+        session_expiry = int(item["sessionExp"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise AuthError("invalid browser session exchange") from error
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", session_id):
+        raise AuthError("invalid browser session exchange")
+    if session_expiry <= time.time():
+        raise AuthError("browser session exchange expired or already used")
+    return session_id, session_expiry
+
+
 def verify_browser_session(session_id, table):
     """Return server-side claims for an unexpired opaque browser session, without accepting a JWT from the browser."""
     if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", session_id):
         return None
     item = table.get_item(Key=_browser_session_key(session_id), ConsistentRead=True).get("Item")
-    if not item or int(item.get("exp") or 0) <= time.time():
+    try:
+        issued_at, expires_at = int(item["iat"]), int(item["exp"])
+    except (KeyError, TypeError, ValueError):
         return None
-    return {key: item.get(key) for key in ("sub", "name", "name_source", "jti", "iat", "exp", "csrf")}
+    if expires_at <= time.time():
+        return None
+    return {**{key: item.get(key) for key in ("sub", "name", "name_source", "jti", "csrf")},
+            "iat": issued_at, "exp": expires_at}
 
 
 def delete_browser_session(table, session_id):

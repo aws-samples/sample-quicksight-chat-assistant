@@ -44,6 +44,30 @@ test("signed out: login prompt; a token left in localStorage by an older version
   assert.equal(w.document.getElementById("q").disabled, true);
 });
 
+test("popup exchanges a one-time code before reading the partitioned cookie", async () => {
+  let popup;
+  let popupUrl;
+  const { w, log, calls } = boot((w) => {
+    popup = { closed: false };
+    w.open = (url) => { popupUrl = url; return popup; };
+  });
+  await tick();
+  log.querySelector("#loginBtn").click();
+  const nonce = new URL(popupUrl, w.location.origin).searchParams.get("nonce");
+  w.__identity = { sub: SUB, name: "Alex", exp: Date.now() / 1000 + 3600, csrf: "csrf-token" };
+  w.dispatchEvent(new w.MessageEvent("message", {
+    origin: w.location.origin, source: popup,
+    data: { type: "qsca-auth", nonce, exchange: "e".repeat(43) },
+  }));
+  await tick();
+  const exchange = calls.find((call) => call.url === "/auth/exchange");
+  assert.ok(exchange);
+  assert.equal(exchange.options.method, "POST");
+  assert.deepEqual(JSON.parse(exchange.options.body), { exchange: "e".repeat(43) });
+  assert.equal(exchange.options.credentials, "include");
+  assert.equal(w.document.getElementById("q").disabled, false);
+});
+
 test("signed in (opaque cookie): replayed history renders markup as text and wires the change buttons", async () => {
   const change = { id: "c".repeat(32), summary: "<b>改标题</b>", expires_at: Date.now() / 1000 + 600 };
   const turns = [
